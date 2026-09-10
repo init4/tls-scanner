@@ -40,8 +40,8 @@ export default function ScanForm({ onScan, loading }) {
         {loading ? "scanning…" : "run scan"}
       </button>
       <div className="form-hint">
-        Certificate verification is intentionally disabled -- this tool is built to reach bare IPs and
-        self-signed/untrusted endpoints and report on what it finds, not to reject them.
+        Probes still connect to bare IPs and self-signed/untrusted endpoints a normal client would
+        refuse -- but chain trust is verified separately, and an untrusted chain caps the grade at "T".
       </div>
     </form>
   );
