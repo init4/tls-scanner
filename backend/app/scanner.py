@@ -187,7 +187,9 @@ def _recv_record(sock: socket.socket, deadline: float) -> Optional[tuple[int, by
 
 def _parse_server_hello(body: bytes) -> Optional[dict]:
     try:
-        pos = 2 + 32  # version (unused: client_version already pins the negotiated floor) + random
+        pos = 2  # legacy_version (unused: client_version already pins the negotiated floor)
+        random = body[pos:pos + 32]
+        pos += 32
         session_id_len = body[pos]
         pos += 1 + session_id_len
         cipher_suite = struct.unpack(">H", body[pos:pos + 2])[0]
@@ -205,8 +207,8 @@ def _parse_server_hello(body: bytes) -> Optional[dict]:
                 pos += 4
                 extensions[ext_type] = body[pos:pos + ext_len]
                 pos += ext_len
-        return {"cipher_suite": cipher_suite, "compression_method": compression_method,
-                "extensions": extensions}
+        return {"random": random, "cipher_suite": cipher_suite,
+                "compression_method": compression_method, "extensions": extensions}
     except (IndexError, struct.error):
         return None
 
@@ -446,8 +448,15 @@ def probe_tls13_suite(host: str, port: int, sni: Optional[str], timeout: float,
 # Support for these group names depends entirely on the OpenSSL version
 # baked into the container image (see backend/Containerfile):
 #   * OpenSSL >= 3.5  -> native ML-KEM hybrids (X25519MLKEM768, etc.)
-#   * OpenSSL 3.2/3.3 -> draft Kyber hybrids only, via oqs-provider if installed
 #   * older           -> none of these will be recognised; reported as untestable
+#
+# The pre-standard draft Kyber768 hybrid (X25519Kyber768Draft00) is a special
+# case: OpenSSL 3.5 dropped that identifier string entirely (confirmed absent
+# from `openssl list -tls-groups`), so there's no name we could ever pass to
+# the CLI for it, regardless of OpenSSL version. For that one group we fall
+# back to a raw-socket technique instead (see probe_pqc_group_via_hrr below)
+# that tests group-level support without needing the local OpenSSL to
+# recognise the name -- or implementing the group's actual key-exchange math.
 # ---------------------------------------------------------------------------
 
 PQC_CANDIDATE_GROUPS = [
@@ -459,6 +468,97 @@ PQC_CANDIDATE_GROUPS = [
     ("secp256r1", "classical"),
     ("secp384r1", "classical"),
 ]
+
+# Group codepoints for names the CLI path can never use (see comment above).
+# Sourced from the IANA TLS SupportedGroups registry / draft-tls-westerbaan-
+# xyber768d00, which is the codepoint Chrome and Cloudflare's early PQC
+# rollouts used before the final ML-KEM standard existed.
+_RAW_GROUP_CODEPOINTS = {"X25519Kyber768Draft00": 0x6399}
+
+# RFC 8446 Sec 4.1.3: a HelloRetryRequest is wire-identical to a ServerHello
+# (same handshake message type, 2) except its "random" field is hardcoded to
+# this fixed value -- it's the only way to tell the two apart.
+_HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+assert len(_HRR_RANDOM) == 32
+
+_SUPPORTED_VERSIONS_EXT = 0x002B
+_SUPPORTED_GROUPS_EXT = 0x000A
+_KEY_SHARE_EXT = 0x0033
+_SIGNATURE_ALGORITHMS_EXT = 0x000D
+_TLS13_PROBE_CIPHER_SUITES = [0x1301, 0x1302, 0x1303]  # AES128/256-GCM, CHACHA20-POLY1305
+# A broad-enough spread that no real server ever rejects a ClientHello for
+# lacking a signature algorithm it likes -- this extension is mandatory in
+# TLS 1.3 ClientHellos, but its actual content is irrelevant to this probe.
+_SIGNATURE_ALGORITHMS = [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0807]
+
+_ALERT_ILLEGAL_PARAMETER = 47
+_ALERT_DECODE_ERROR = 50
+_ALERT_MISSING_EXTENSION = 109
+
+
+def _build_hrr_probe_client_hello(group_codepoint: int, sni: Optional[str]) -> bytes:
+    extensions = _encode_extension(_SUPPORTED_VERSIONS_EXT, bytes([2]) + struct.pack(">H", 0x0304))
+    extensions += _encode_extension(_SUPPORTED_GROUPS_EXT,
+                                     struct.pack(">H", 2) + struct.pack(">H", group_codepoint))
+    extensions += _encode_extension(_KEY_SHARE_EXT, struct.pack(">H", 0))  # deliberately empty
+    sig_algs = b"".join(struct.pack(">H", a) for a in _SIGNATURE_ALGORITHMS)
+    extensions += _encode_extension(_SIGNATURE_ALGORITHMS_EXT, struct.pack(">H", len(sig_algs)) + sig_algs)
+    if sni:
+        try:
+            extensions += _encode_sni_extension(sni)
+        except UnicodeEncodeError:
+            pass
+    return _build_client_hello((3, 3), _TLS13_PROBE_CIPHER_SUITES, [0], extensions)
+
+
+def probe_pqc_group_via_hrr(host: str, port: int, sni: Optional[str], timeout: float,
+                             group_name: str, group_codepoint: int, kind: str) -> PqcGroupResult:
+    """Tests TLS 1.3 group support without completing a real key exchange.
+
+    Offers `group_codepoint` as the *only* entry in supported_groups, with an
+    empty key_share list -- RFC 8446 Sec 4.2.8 explicitly allows this
+    specifically to elicit a HelloRetryRequest naming the group the server
+    wants a key_share for next. Since we only offered one group, a server
+    that supports it has nothing else to ask for; one that doesn't can't
+    retry into anything and has to abort. No PQC key-exchange math required
+    -- useful for groups the local OpenSSL CLI can't even name.
+    """
+    hello = _build_hrr_probe_client_hello(group_codepoint, sni)
+    kind_resp, data = _send_client_hello_and_read(host, port, timeout, hello)
+
+    if kind_resp == "server_hello":
+        if data.get("random") == _HRR_RANDOM:
+            key_share = data["extensions"].get(_KEY_SHARE_EXT)
+            if key_share and len(key_share) == 2 and struct.unpack(">H", key_share)[0] == group_codepoint:
+                return PqcGroupResult(
+                    name=group_name, kind=kind, supported=True,
+                    note="Server requested this exact group via a HelloRetryRequest (RFC 8446) -- "
+                         "confirms group-level support without completing a full key exchange.")
+            return PqcGroupResult(name=group_name, kind=kind, supported=None,
+                                   note="Server sent a HelloRetryRequest but not for this group -- unexpected; "
+                                        "could not confirm.")
+        # A normal ServerHello in response to an empty key_share list isn't
+        # spec-valid for an (EC)DHE group negotiation -- don't guess.
+        return PqcGroupResult(name=group_name, kind=kind, supported=None,
+                               note="Got an unexpected ServerHello (not a HelloRetryRequest); could not confirm.")
+
+    if kind_resp == "alert":
+        _level, desc = data
+        if desc in (_ALERT_ILLEGAL_PARAMETER, _ALERT_DECODE_ERROR, _ALERT_MISSING_EXTENSION):
+            return PqcGroupResult(
+                name=group_name, kind=kind, supported=None,
+                note=f"Server rejected the probe's ClientHello shape (alert {desc}), not necessarily the "
+                     "group itself -- some TLS stacks are stricter than RFC 8446 technically allows about "
+                     "an empty key_share list. Inconclusive rather than a confirmed non-support.")
+        return PqcGroupResult(name=group_name, kind=kind, supported=False,
+                               note=f"Server rejected the group ({_ALERT_DESCRIPTIONS.get(desc, f'alert {desc}')}).")
+
+    if kind_resp == "closed":
+        return PqcGroupResult(name=group_name, kind=kind, supported=False,
+                               note="Connection closed without responding.")
+    if kind_resp == "timeout":
+        return PqcGroupResult(name=group_name, kind=kind, supported=False, note="Timed out.")
+    return PqcGroupResult(name=group_name, kind=kind, supported=None, note=f"Could not determine: {data}")
 
 
 def get_openssl_version() -> str:
@@ -472,6 +572,9 @@ def get_openssl_version() -> str:
 
 def probe_pqc_group(host: str, port: int, sni: Optional[str], timeout: float,
                      group_name: str, kind: str) -> PqcGroupResult:
+    if group_name in _RAW_GROUP_CODEPOINTS:
+        return probe_pqc_group_via_hrr(host, port, sni, timeout, group_name,
+                                        _RAW_GROUP_CODEPOINTS[group_name], kind)
     target = f"{host}:{port}"
     cmd = [
         "openssl", "s_client",

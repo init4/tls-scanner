@@ -147,6 +147,18 @@ OpenSSL build inside the **backend container**:
   a statement about the scanner's own OpenSSL, not about the target server.
   The UI and `pqc_readiness_score` reflect this explicitly rather than
   silently reporting "not supported."
+- The one exception is `X25519Kyber768Draft00`, the pre-standard hybrid that
+  Chrome and some early PQC rollouts (Cloudflare included) used before the
+  final ML-KEM codepoints existed -- OpenSSL 3.5 dropped that identifier
+  string outright (it's absent from `openssl list -tls-groups` regardless of
+  version), so there's no name the CLI path can ever use for it. That one
+  group is instead tested over a raw socket: the scanner sends a TLS 1.3
+  ClientHello offering *only* that group's codepoint with an empty
+  `key_share` list. RFC 8446 Sec 4.2.8 explicitly allows this specifically to
+  elicit a HelloRetryRequest naming the group the server wants a key share
+  for next -- since we only offered one group, a server that supports it has
+  nothing else to ask for, confirming support without needing to implement
+  Kyber's actual key-exchange math at all.
 - The headline letter grade (A+ .. F) is **not** affected by PQC results --
   it's graded on classical protocol/cipher/certificate hygiene only. PQC
   readiness is surfaced as its own separate score/badge, since almost no
