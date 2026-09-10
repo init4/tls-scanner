@@ -60,6 +60,34 @@ class CertificateInfo(BaseModel):
     signature_algorithm: str
     sans: List[str] = []
     trust_note: str
+    chain_trusted: Optional[bool] = None  # None => trust probe itself failed/inconclusive
+    chain_trust_note: Optional[str] = None
+
+
+class DnsCaaRecord(BaseModel):
+    flags: int
+    tag: str
+    value: str
+
+
+class DnsCaaResult(BaseModel):
+    applicable: bool  # False for bare-IP targets -- CAA is a DNS record, doesn't apply
+    records: List[DnsCaaRecord] = []
+    note: Optional[str] = None
+
+
+class HttpHeaderFinding(BaseModel):
+    header: str
+    present: bool
+    value: Optional[str] = None
+    note: Optional[str] = None
+
+
+class HttpSecurityHeaders(BaseModel):
+    checked: bool  # False if an HTTP request/response round trip couldn't complete at all
+    status_code: Optional[int] = None
+    headers: List[HttpHeaderFinding] = []
+    note: Optional[str] = None
 
 
 class Finding(BaseModel):
@@ -75,6 +103,8 @@ class Scoring(BaseModel):
     overall_grade: str
     pqc_readiness_score: int
     pqc_readiness_label: str
+    http_headers_score: int
+    http_headers_label: str
     findings: List[Finding]
 
 
@@ -95,5 +125,7 @@ class ScanResult(BaseModel):
     key_exchange_groups: List[PqcGroupResult]
     legacy_checks: List[LegacyCheckResult] = []
     certificate: Optional[CertificateInfo]
+    dns_caa: Optional[DnsCaaResult] = None
+    http_security_headers: Optional[HttpSecurityHeaders] = None
     scoring: Scoring
     errors: List[str] = []

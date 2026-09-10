@@ -48,6 +48,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# The OpenSSL we just built has its own (empty) OPENSSLDIR at
+# /opt/openssl-pqc/ssl, separate from Debian's actual CA trust store at
+# /etc/ssl/certs (populated by the base image's ca-certificates package).
+# Without this, ssl.create_default_context() -- and this openssl binary's
+# own default verify paths -- find zero trusted certs, so every real
+# chain-trust check fails even against well-known public CAs. Point it at
+# the real, ca-certificates-managed bundle instead.
+RUN mkdir -p /opt/openssl-pqc/ssl \
+    && ln -s /etc/ssl/certs/ca-certificates.crt /opt/openssl-pqc/ssl/cert.pem \
+    && ln -s /etc/ssl/certs /opt/openssl-pqc/ssl/certs
+
 # Non-root: podman-friendly (works fine with rootless podman's default
 # user namespace remapping too).
 RUN useradd --no-create-home --uid 10001 scanner

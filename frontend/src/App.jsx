@@ -7,6 +7,7 @@ import CipherList from "./components/CipherList.jsx";
 import CertificatePanel from "./components/CertificatePanel.jsx";
 import PqcGroupsPanel from "./components/PqcGroupsPanel.jsx";
 import LegacyChecksPanel from "./components/LegacyChecksPanel.jsx";
+import HttpHeadersPanel from "./components/HttpHeadersPanel.jsx";
 import FindingsList from "./components/FindingsList.jsx";
 import RawJsonPanel from "./components/RawJsonPanel.jsx";
 import { runScan } from "./api.js";
@@ -36,7 +37,7 @@ export default function App() {
         <h1>
           <span className="prompt">$</span>tls-pqc-scan
         </h1>
-        <span className="subtitle">protocols · ciphers · certificates · PQC readiness</span>
+        <span className="subtitle">protocols · ciphers · certificate trust · CAA · HTTP headers · PQC readiness</span>
       </header>
 
       <ScanForm onScan={handleScan} loading={loading} />
@@ -75,7 +76,12 @@ export default function App() {
             <LegacyChecksPanel checks={result.legacy_checks} />
             <PqcGroupsPanel groups={result.key_exchange_groups} />
             <CipherList ciphers={result.ciphers} />
-            <CertificatePanel cert={result.certificate} />
+            <CertificatePanel cert={result.certificate} caa={result.dns_caa} />
+            <HttpHeadersPanel
+              headers={result.http_security_headers}
+              score={result.scoring.http_headers_score}
+              label={result.scoring.http_headers_label}
+            />
             <FindingsList findings={result.scoring.findings} />
             <RawJsonPanel data={result} />
           </div>

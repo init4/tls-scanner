@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import scanner
 from .models import (
     CipherResult,
+    DnsCaaResult,
+    HttpSecurityHeaders,
     LegacyCheckResult,
     ProtocolResult,
     PqcGroupResult,
@@ -110,7 +112,11 @@ def scan(req: ScanRequest):
         futures[("legacy", check_name)] = _executor.submit(probe_fn, host, port, sni, timeout)
 
     cert_future = _executor.submit(scanner.get_certificate_info, host, port, sni, timeout)
+    trust_future = _executor.submit(scanner.check_chain_trust, host, port, sni, timeout)
+    http_headers_future = _executor.submit(scanner.check_http_security_headers, host, port, sni, timeout)
     ip_future = _executor.submit(scanner.resolve_ip, host)
+    is_ip_target = _looks_like_ip(host)
+    caa_future = None if is_ip_target else _executor.submit(scanner.lookup_caa_records, host, timeout)
 
     protocols: list[ProtocolResult] = []
     ciphers: list[CipherResult] = []
@@ -141,6 +147,30 @@ def scan(req: ScanRequest):
         certificate = None
 
     try:
+        chain_trusted, chain_trust_note = trust_future.result()
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"certificate chain trust check raised {e}")
+        chain_trusted, chain_trust_note = None, None
+    if certificate is not None:
+        certificate.chain_trusted = chain_trusted
+        certificate.chain_trust_note = chain_trust_note
+
+    try:
+        http_security_headers = http_headers_future.result()
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"HTTP security header check raised {e}")
+        http_security_headers = HttpSecurityHeaders(checked=False, note=f"probe raised {e}")
+
+    if is_ip_target:
+        dns_caa = DnsCaaResult(applicable=False, note="Target is a bare IP; CAA is a DNS record and doesn't apply.")
+    else:
+        try:
+            dns_caa = caa_future.result()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"DNS CAA lookup raised {e}")
+            dns_caa = DnsCaaResult(applicable=True, note=f"lookup raised {e}")
+
+    try:
         resolved_ip = ip_future.result()
     except Exception:
         resolved_ip = None
@@ -166,7 +196,8 @@ def scan(req: ScanRequest):
             strength="strong", forward_secrecy=True, aead=True,
         ))
 
-    scoring = compute_scoring(protocols, ciphers, certificate, pqc_groups, legacy_checks)
+    scoring = compute_scoring(protocols, ciphers, certificate, pqc_groups, legacy_checks,
+                               dns_caa, http_security_headers)
 
     duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -180,6 +211,8 @@ def scan(req: ScanRequest):
         key_exchange_groups=pqc_groups,
         legacy_checks=legacy_checks,
         certificate=certificate,
+        dns_caa=dns_caa,
+        http_security_headers=http_security_headers,
         scoring=scoring,
         errors=errors,
     )

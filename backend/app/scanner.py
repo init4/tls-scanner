@@ -29,7 +29,17 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
-from .models import CertificateInfo, CipherResult, LegacyCheckResult, ProtocolResult, PqcGroupResult
+from .models import (
+    CertificateInfo,
+    CipherResult,
+    DnsCaaRecord,
+    DnsCaaResult,
+    HttpHeaderFinding,
+    HttpSecurityHeaders,
+    LegacyCheckResult,
+    ProtocolResult,
+    PqcGroupResult,
+)
 
 # ---------------------------------------------------------------------------
 # Protocol probing
@@ -682,6 +692,248 @@ def get_certificate_info(host: str, port: int, sni: Optional[str],
         )
     except Exception:  # noqa: BLE001
         return None
+
+
+def check_chain_trust(host: str, port: int, sni: Optional[str],
+                       timeout: float) -> tuple[Optional[bool], Optional[str]]:
+    """Attempts a REAL, fully-verified TLS handshake against the system CA
+    trust store -- independent of get_certificate_info's deliberately
+    unverified connection above (which exists so an untrusted/self-signed
+    cert doesn't abort the scan before we can inspect it). This is what
+    actually answers "would a normal browser trust this?", which the rest of
+    this tool has never tried to answer before.
+
+    Returns (trusted, note): trusted is True/False once determined, or None
+    if the probe itself was inconclusive (distinct from a confirmed failure).
+    """
+    verify_hostname = sni or host  # Python's ssl module matches IP SANs fine
+    # when server_hostname is an IP literal, and skips sending it as SNI.
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=verify_hostname) as tls:
+                tls.do_handshake()
+                return True, None
+    except ssl.SSLCertVerificationError as e:
+        return False, (e.verify_message or str(e)).strip()
+    except ssl.SSLError as e:
+        return False, str(e)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return None, f"could not determine: {e}"
+
+
+# ---------------------------------------------------------------------------
+# DNS CAA record lookup
+#
+# CAA (RFC 8659) lets a domain owner restrict which Certificate Authorities
+# may issue certs for it; compliant CAs are required to check it before
+# issuing. Python's stdlib has no API for arbitrary DNS record types
+# (socket.getaddrinfo only does A/AAAA), so this speaks the DNS wire
+# protocol directly over UDP -- same approach as the raw TLS work above, and
+# for the same reason: querying a hardcoded public resolver (8.8.8.8 etc.)
+# would silently break this for the internal/split-horizon hostnames this
+# tool exists to scan, so it uses whatever resolver the container itself is
+# configured with instead.
+#
+# Known simplification: queries only the exact scanned hostname. The full
+# RFC 8659 lookup algorithm also walks up to parent domains (and follows
+# CNAMEs) when no CAA record exists at the exact name -- good enough to
+# answer "did this host configure CAA", not a substitute for a full
+# CAA-compliance audit.
+# ---------------------------------------------------------------------------
+
+_DNS_TYPE_CAA = 257
+_DNS_CLASS_IN = 1
+
+
+def _system_resolvers() -> list[str]:
+    resolvers = []
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    resolvers.append(parts[1])
+    except OSError:
+        pass
+    return resolvers
+
+
+def _encode_dns_name(name: str) -> bytes:
+    out = b""
+    for label in name.rstrip(".").split("."):
+        encoded = label.encode("ascii")
+        out += struct.pack(">B", len(encoded)) + encoded
+    return out + b"\x00"
+
+
+def _decode_dns_name(data: bytes, pos: int) -> tuple[str, int]:
+    """Decodes a (possibly compressed, RFC 1035 Sec 4.1.4) DNS name starting
+    at `pos`. Returns (name, position immediately after the name's own
+    encoding -- i.e. where the caller should resume reading, which is NOT
+    necessarily where the labels themselves end if a compression pointer was
+    followed)."""
+    labels = []
+    resume_at = None
+    pos_here = pos
+    for _ in range(128):  # guard against a malformed/malicious pointer loop
+        length = data[pos_here]
+        if length == 0:
+            pos_here += 1
+            if resume_at is None:
+                resume_at = pos_here
+            break
+        if length & 0xC0 == 0xC0:
+            pointer = struct.unpack(">H", data[pos_here:pos_here + 2])[0] & 0x3FFF
+            if resume_at is None:
+                resume_at = pos_here + 2
+            pos_here = pointer
+            continue
+        pos_here += 1
+        labels.append(data[pos_here:pos_here + length].decode("ascii", errors="replace"))
+        pos_here += length
+    else:
+        raise ValueError("DNS name decompression exceeded reasonable depth")
+    return ".".join(labels), resume_at
+
+
+def _build_dns_query(qname: str, qtype: int) -> tuple[bytes, int]:
+    query_id = struct.unpack(">H", os.urandom(2))[0]
+    header = struct.pack(">HHHHHH", query_id, 0x0100, 1, 0, 0, 0)  # recursion desired
+    question = _encode_dns_name(qname) + struct.pack(">HH", qtype, _DNS_CLASS_IN)
+    return header + question, query_id
+
+
+def _parse_dns_response(data: bytes, expected_id: int) -> Optional[dict]:
+    try:
+        resp_id, flags, qdcount, ancount, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+        if resp_id != expected_id:
+            return None
+        pos = 12
+        for _ in range(qdcount):
+            _name, pos = _decode_dns_name(data, pos)
+            pos += 4  # QTYPE + QCLASS
+        answers = []
+        for _ in range(ancount):
+            _name, pos = _decode_dns_name(data, pos)
+            rtype, _rclass, _ttl, rdlength = struct.unpack(">HHIH", data[pos:pos + 10])
+            pos += 10
+            answers.append((rtype, data[pos:pos + rdlength]))
+            pos += rdlength
+        return {"rcode": flags & 0x000F, "answers": answers}
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+def lookup_caa_records(hostname: str, timeout: float) -> DnsCaaResult:
+    resolvers = _system_resolvers()
+    if not resolvers:
+        return DnsCaaResult(applicable=True, records=[],
+                             note="no DNS resolver configured in this container (/etc/resolv.conf empty or unreadable)")
+
+    query, query_id = _build_dns_query(hostname, _DNS_TYPE_CAA)
+    for resolver_ip in resolvers:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(query, (resolver_ip, 53))
+                data, _addr = sock.recvfrom(4096)
+        except (socket.timeout, OSError):
+            continue
+        parsed = _parse_dns_response(data, query_id)
+        if parsed is None or parsed["rcode"] not in (0, 3):  # NOERROR or NXDOMAIN
+            continue
+        records = []
+        for rtype, rdata in parsed["answers"]:
+            if rtype == _DNS_TYPE_CAA and len(rdata) >= 2:
+                tag_len = rdata[1]
+                tag = rdata[2:2 + tag_len].decode("ascii", errors="replace")
+                value = rdata[2 + tag_len:].decode("ascii", errors="replace")
+                records.append(DnsCaaRecord(flags=rdata[0], tag=tag, value=value))
+        return DnsCaaResult(applicable=True, records=records)
+    return DnsCaaResult(applicable=True, records=[], note="could not reach any configured DNS resolver")
+
+
+# ---------------------------------------------------------------------------
+# HTTP security headers
+#
+# A layer up from everything else in this file -- this sends a real HTTP
+# request over the TLS connection and inspects the response headers, rather
+# than just completing a handshake. Uses the same unverified connection
+# style as the rest of the scanner (a broken/self-signed chain shouldn't
+# stop this check either), and a single GET / with no redirect-following --
+# good enough to answer "what does a browser see on first load", not a full
+# crawl.
+# ---------------------------------------------------------------------------
+
+_SECURITY_HEADERS = [
+    "Strict-Transport-Security",
+    "Content-Security-Policy",
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+]
+
+
+def check_http_security_headers(host: str, port: int, sni: Optional[str],
+                                 timeout: float) -> HttpSecurityHeaders:
+    host_header = sni or host
+    request = (
+        f"GET / HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"User-Agent: tls-pqc-scanner\r\n"
+        f"Accept: */*\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii")
+    try:
+        ctx = _bare_context()
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+                tls.sendall(request)
+                tls.settimeout(timeout)
+                buf = b""
+                while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+    except (socket.timeout, ConnectionRefusedError, OSError, ssl.SSLError) as e:
+        return HttpSecurityHeaders(checked=False, note=f"could not complete an HTTP request: {e}")
+
+    head, _, _ = buf.partition(b"\r\n\r\n")
+    if not head:
+        return HttpSecurityHeaders(checked=False, note="no HTTP response received")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status_code = None
+    if lines and lines[0].startswith("HTTP/"):
+        try:
+            status_code = int(lines[0].split()[1])
+        except (IndexError, ValueError):
+            pass
+
+    received: dict[str, str] = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        if name:
+            received[name.strip().lower()] = value.strip()
+
+    findings = []
+    for header in _SECURITY_HEADERS:
+        value = received.get(header.lower())
+        note = None
+        if header == "X-Frame-Options" and value is None:
+            # frame-ancestors in CSP is the modern, spec-preferred
+            # replacement for X-Frame-Options (more flexible: supports
+            # multiple origins, not just DENY/SAMEORIGIN) -- flagging it
+            # "missing" when a site already has equivalent-or-better
+            # clickjacking protection via CSP would be a false negative.
+            csp = received.get("content-security-policy", "")
+            if "frame-ancestors" in csp:
+                note = "Not set, but Content-Security-Policy's frame-ancestors directive provides equivalent (and more flexible) clickjacking protection."
+        findings.append(HttpHeaderFinding(header=header, present=value is not None, value=value, note=note))
+
+    return HttpSecurityHeaders(checked=True, status_code=status_code, headers=findings)
 
 
 def resolve_ip(host: str) -> Optional[str]:

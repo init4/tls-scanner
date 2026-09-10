@@ -10,9 +10,10 @@ browser or HTTP client would refuse to talk to.
 - **Frontend**: React + Vite single-page app, calls the backend over `/api`.
 - **Containers**: Podman-first (`podman-compose` or plain `podman play
   kube`, no Docker required), but also works out of the box with plain
-  Docker -- `docker-compose.yml` and each `Dockerfile` are symlinks to the
-  same `podman-compose.yml`/`Containerfile`s, so there's one build
-  definition either way, not two to keep in sync.
+  Docker -- `compose.yaml` is the modern Compose Specification filename
+  both `podman-compose` and `docker compose` check for by default, and each
+  `Dockerfile` is a symlink to the matching `Containerfile`, so there's one
+  build definition either way, not two to keep in sync.
 
 ## Quick start (podman-compose)
 
@@ -46,10 +47,11 @@ podman play kube deploy/pod.yaml
 
 ## Quick start (Docker)
 
-No separate Docker setup to maintain: `docker-compose.yml` at the repo root
-and `Dockerfile` in each of `backend/` and `frontend/` are symlinks to the
-same `podman-compose.yml` and `Containerfile`s the Podman path uses, so
-there's nothing to keep in sync between the two.
+No separate Docker setup to maintain: `compose.yaml` at the repo root is the
+one file both `podman-compose` and `docker compose` find by default (don't
+add a second compose file under an alternate default name alongside it --
+see the comment in `compose.yaml` for why), and `Dockerfile` in each of
+`backend/` and `frontend/` is a symlink to the matching `Containerfile`.
 
 ```bash
 git clone <this repo> tls-scanner && cd tls-scanner
@@ -199,7 +201,8 @@ OpenSSL build inside the **backend container**:
 backend/
   app/
     main.py      FastAPI routes, request orchestration (concurrent probes)
-    scanner.py   protocol / cipher / certificate / PQC-group / legacy-downgrade probes
+    scanner.py   protocol / cipher / certificate (+ chain trust) / PQC-group /
+                 legacy-downgrade / DNS CAA / HTTP-header probes
     scoring.py   turns raw probe data into scores, grade, findings
     models.py    pydantic schema for the JSON contract
   Containerfile  builds OpenSSL 3.5 from source, then the FastAPI app
@@ -211,8 +214,7 @@ frontend/
   Dockerfile     symlink -> Containerfile
 deploy/
   pod.yaml       plain `podman play kube` deployment (no compose needed)
-podman-compose.yml
-docker-compose.yml  symlink -> podman-compose.yml
+compose.yaml     one compose file, found by both podman-compose and docker compose
 ```
 
 ## SSLv3 and the other legacy/downgrade checks
@@ -243,12 +245,45 @@ rather than guessing when the probe's ClientHello doesn't get a usable
 response -- that's a statement about what could be determined, not a claim
 that the check failed.
 
+## Certificate trust, DNS CAA, and HTTP security headers
+
+Three checks that go beyond raw TLS configuration:
+
+- **Chain trust.** Every other probe in this tool connects with certificate
+  verification deliberately disabled (`ssl.CERT_NONE`), on purpose -- this
+  is a scanner meant to reach self-signed/internal endpoints a normal
+  client would refuse. But that design choice used to mean chain trust was
+  never checked *at all*, and a host with a flawless protocol/cipher setup
+  and a self-signed cert could still earn a top grade. There's now a
+  separate probe (`check_chain_trust`) that attempts a REAL, fully-verified
+  handshake against the system CA trust store, independent of every other
+  probe. If it fails, the overall letter grade is forced to **`T`** (Trust
+  Issues) regardless of the underlying numeric score -- the same convention
+  Qualys SSL Labs uses. A self-signed or otherwise untrusted chain can no
+  longer coexist with a good grade. (The leaf-level inspection -- key size,
+  signature algorithm, expiry, self-signed flag -- still happens
+  unconditionally either way, same as before; only the grade's relationship
+  to trust changed.)
+- **DNS CAA** (RFC 8659): a DNS TXT-like record restricting which CAs may
+  issue certs for a domain. Checked via a hand-rolled DNS query over UDP
+  (Python's stdlib has no API for non-A/AAAA record types) against whatever
+  resolver the container itself is configured with -- deliberately not a
+  hardcoded public resolver like 8.8.8.8, since that would silently break
+  this for internal/split-horizon hostnames. Only queries the exact scanned
+  hostname, not the full RFC 8659 parent-domain/CNAME-walk; good enough to
+  answer "did this host configure CAA", not a full compliance audit. Not
+  applicable to bare-IP targets (CAA is a DNS record, not tied to an IP).
+- **HTTP security headers**: a real `GET /` over the established TLS
+  connection (no redirect-following), checking for `Strict-Transport-Security`,
+  `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, and `Permissions-Policy`. Reported as its own score/label
+  (like PQC readiness) rather than folded into the main grade, since it's a
+  genuinely different security layer -- application hardening, not transport
+  crypto. Missing `X-Frame-Options` isn't flagged if `Content-Security-Policy`
+  already sets `frame-ancestors`, its modern, more flexible replacement.
+
 ## Notes / known limitations
 
-- Certificate chain validation is intentionally disabled everywhere (this
-  is a scanner meant to reach untrusted endpoints on purpose). The
-  certificate panel reports on the leaf cert's own health (key size, sig
-  algorithm, expiry, self-signed) rather than chain trust.
 - Legacy protocol probing (TLS 1.0/1.1) depends on the backend's OpenSSL
   still being willing to negotiate them at `SECLEVEL=0`; some hardened
   distros disable this entirely, which will show up as "not supported"

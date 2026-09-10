@@ -4,14 +4,23 @@ and a findings list the frontend can render as a checklist.
 
 Grading philosophy
 -------------------
-* The headline grade (A+ .. F) reflects CLASSICAL TLS hygiene: protocol
-  versions, cipher strength, certificate health. This is what "secure
-  today" means.
-* PQC readiness is reported as its OWN separate score/label rather than
-  blended into the headline grade. Almost no server today negotiates a
-  PQC hybrid group, so folding it into the main grade would make every
-  score look artificially bad; it's forward-looking information, not a
-  pass/fail on today's baseline.
+* The headline grade (A+ .. F, or T) reflects CLASSICAL TLS hygiene:
+  protocol versions, cipher strength, certificate health -- including, as
+  of the chain-trust check, whether the certificate is actually trusted by
+  a standard CA store. A server can't reach a good letter grade without
+  that: an untrusted/self-signed chain forces the grade to "T" (Trust
+  Issues) regardless of how clean everything else is, the same convention
+  Qualys SSL Labs uses. This is a deliberate policy, not an oversight --
+  self-signed certs used to be explicitly excluded from scoring (this tool
+  is built to reach them on purpose), but "perfect protocol/cipher config,
+  nobody can actually verify who they're talking to" isn't a good score.
+* PQC readiness and HTTP security headers are each reported as their OWN
+  separate score/label rather than blended into the headline grade -- PQC
+  because almost no server today negotiates a hybrid group (folding it in
+  would make every score look artificially bad for forward-looking info,
+  not a pass/fail on today's baseline), and HTTP headers because they're a
+  different security layer entirely (application-layer hardening, not
+  transport-layer crypto) that happens to be useful to check alongside TLS.
 """
 from __future__ import annotations
 
@@ -20,7 +29,9 @@ from typing import List
 from .models import (
     CertificateInfo,
     CipherResult,
+    DnsCaaResult,
     Finding,
+    HttpSecurityHeaders,
     LegacyCheckResult,
     ProtocolResult,
     PqcGroupResult,
@@ -116,13 +127,48 @@ def _cipher_score(ciphers: List[CipherResult], findings: List[Finding]) -> int:
     return max(0, min(100, score))
 
 
-def _certificate_score(cert: CertificateInfo | None, findings: List[Finding]) -> int:
+def _certificate_score(cert: CertificateInfo | None, dns_caa: DnsCaaResult | None,
+                        findings: List[Finding]) -> int:
     if cert is None:
         findings.append(Finding(severity="medium",
                                  message="Certificate could not be retrieved or parsed."))
         return 50
 
     score = 100
+    if cert.chain_trusted is False:
+        score = min(score, 30)
+        findings.append(Finding(
+            severity="critical",
+            message=f"Certificate chain is not trusted by a standard CA trust store "
+                    f"({cert.chain_trust_note or 'verification failed'}). This overrides the "
+                    f"overall letter grade to 'T' (Trust Issues) regardless of protocol/cipher "
+                    f"configuration."))
+    elif cert.chain_trusted is True:
+        findings.append(Finding(severity="info",
+                                 message="Certificate chain is verified and trusted by a standard CA trust store."))
+    else:
+        findings.append(Finding(severity="low",
+                                 message="Could not determine whether the certificate chain is trusted "
+                                         "(the trust-verification probe failed independently of the certificate lookup)."))
+
+    if cert.self_signed:
+        findings.append(Finding(severity="info",
+                                 message="Certificate is self-signed -- see the chain-of-trust finding "
+                                         "above for how that affects the grade."))
+
+    if dns_caa is not None and dns_caa.applicable:
+        if dns_caa.records:
+            tags = sorted({f"{r.tag}={r.value}" for r in dns_caa.records})
+            findings.append(Finding(severity="info",
+                                     message=f"DNS CAA record(s) present, restricting certificate issuance: {', '.join(tags)}."))
+        elif dns_caa.note is None:
+            score -= 5
+            findings.append(Finding(severity="low",
+                                     message="No DNS CAA record found -- any publicly trusted CA can issue "
+                                             "certificates for this domain. Adding one limits mis-issuance risk."))
+        else:
+            findings.append(Finding(severity="low", message=f"Could not check for a DNS CAA record: {dns_caa.note}"))
+
     if cert.expired:
         score -= 60
         findings.append(Finding(severity="critical", message="Certificate is expired."))
@@ -149,10 +195,6 @@ def _certificate_score(cert: CertificateInfo | None, findings: List[Finding]) ->
         score -= 40
         findings.append(Finding(severity="high",
                                  message=f"Certificate is signed with {cert.signature_algorithm}, a broken/weak hash."))
-
-    if cert.self_signed:
-        findings.append(Finding(severity="info",
-                                 message="Certificate is self-signed (expected for internal hosts/IPs; not scored down)."))
 
     return max(0, min(100, score))
 
@@ -189,7 +231,8 @@ def _pqc_readiness(groups: List[PqcGroupResult], findings: List[Finding]):
     return 0, "Not PQC-ready"
 
 
-def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List[CipherResult]) -> str:
+def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List[CipherResult],
+                       certificate: CertificateInfo | None) -> str:
     by_name = {p.name: p for p in protocols}
     sslv3 = by_name.get("SSLv3")
     tls10 = by_name.get("TLSv1.0")
@@ -197,6 +240,13 @@ def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List
 
     if (sslv3 and sslv3.supported) or has_insecure_cipher:
         return "F"
+    # "T" (Trust Issues) -- same convention Qualys SSL Labs uses -- overrides
+    # every other consideration. A server with a flawless protocol/cipher
+    # config but a chain nothing trusts hasn't earned an A-F grade at all;
+    # chain_trusted is None (probe inconclusive) deliberately does NOT
+    # trigger this, only a confirmed failure does.
+    if certificate is not None and certificate.chain_trusted is False:
+        return "T"
     if tls10 and tls10.supported:
         score = min(score, 65)
 
@@ -213,21 +263,57 @@ def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List
     return "F"
 
 
+def _http_headers_score(headers: HttpSecurityHeaders, findings: List[Finding]) -> tuple[int, str]:
+    if not headers.checked:
+        findings.append(Finding(severity="low",
+                                 message=f"HTTP security headers could not be checked: {headers.note or 'request failed'}."))
+        return 0, "Untestable"
+
+    by_name = {h.header: h for h in headers.headers}
+    present = [h for h in headers.headers if h.present]
+    missing = [h for h in headers.headers if not h.present and h.note is None]
+    covered_by_alt = [h for h in headers.headers if not h.present and h.note]
+
+    for h in present:
+        findings.append(Finding(severity="info", message=f"{h.header} is set ({h.value})."))
+    for h in covered_by_alt:
+        findings.append(Finding(severity="info", message=f"{h.header} is not set, but: {h.note}"))
+    hsts = by_name.get("Strict-Transport-Security")
+    for h in missing:
+        severity = "medium" if h.header in ("Strict-Transport-Security", "Content-Security-Policy") else "low"
+        findings.append(Finding(severity=severity, message=f"{h.header} is not set."))
+
+    effective_present = len(present) + len(covered_by_alt)
+    total = len(headers.headers)
+    score = round(100 * effective_present / total) if total else 0
+
+    if effective_present == total:
+        label = "Fully hardened"
+    elif hsts and hsts.present:
+        label = "Partial"
+    else:
+        label = "Minimal" if effective_present else "None set"
+    return score, label
+
+
 def compute_scoring(protocols: List[ProtocolResult], ciphers: List[CipherResult],
                      certificate: CertificateInfo | None,
                      pqc_groups: List[PqcGroupResult],
-                     legacy_checks: List[LegacyCheckResult]) -> Scoring:
+                     legacy_checks: List[LegacyCheckResult],
+                     dns_caa: DnsCaaResult | None,
+                     http_headers: HttpSecurityHeaders) -> Scoring:
     findings: List[Finding] = []
 
     protocol_score = _protocol_score(protocols, legacy_checks, findings)
     cipher_score = _cipher_score(ciphers, findings)
-    certificate_score = _certificate_score(certificate, findings)
+    certificate_score = _certificate_score(certificate, dns_caa, findings)
     pqc_score, pqc_label = _pqc_readiness(pqc_groups, findings)
+    http_headers_score, http_headers_label = _http_headers_score(http_headers, findings)
 
     overall_score = round(
         protocol_score * 0.40 + cipher_score * 0.35 + certificate_score * 0.25
     )
-    overall_grade = _grade_from_score(overall_score, protocols, ciphers)
+    overall_grade = _grade_from_score(overall_score, protocols, ciphers, certificate)
 
     return Scoring(
         protocol_score=protocol_score,
@@ -237,5 +323,7 @@ def compute_scoring(protocols: List[ProtocolResult], ciphers: List[CipherResult]
         overall_grade=overall_grade,
         pqc_readiness_score=pqc_score,
         pqc_readiness_label=pqc_label,
+        http_headers_score=http_headers_score,
+        http_headers_label=http_headers_label,
         findings=findings,
     )

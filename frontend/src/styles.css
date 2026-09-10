@@ -228,6 +228,14 @@ a {
   color: var(--accent-critical);
   border: 1px solid rgba(229, 72, 77, 0.45);
 }
+.grade-badge.grade-T {
+  /* Dashed, not solid: signals "not a real A-F grade" rather than just
+     another failure tier -- same convention Qualys SSL Labs uses for an
+     untrusted chain overriding an otherwise-computable grade. */
+  background: rgba(229, 72, 77, 0.1);
+  color: var(--accent-critical);
+  border: 1px dashed rgba(229, 72, 77, 0.6);
+}
 
 .pqc-gauge-wrap {
   display: flex;
@@ -374,6 +382,9 @@ a {
 .kv-row .v {
   font-family: var(--font-display);
   text-align: right;
+}
+.kv-row .v.v-bad {
+  color: var(--accent-critical);
 }
 
 /* findings */

@@ -1,9 +1,15 @@
-version: "3.8"
-
-# This file is also exposed at the repo root as docker-compose.yml (a
-# symlink) purely so plain `docker compose` finds it under its own default
-# filename without needing -f -- podman-compose already checks for
-# "podman-compose.yml" by default, Docker's compose does not.
+# Named compose.yaml (the modern Compose Specification filename) rather than
+# podman-compose.yml/docker-compose.yml deliberately: it's in both
+# podman-compose's and Docker's own default-file search order, so either
+# tool finds it with zero -f flags and there's exactly one file to maintain.
+#
+# Don't add a second compose file under an alternate default name
+# (docker-compose.yml, podman-compose.yml, etc.) alongside this one --
+# podman-compose's default-file discovery loads and merges *every* name in
+# its candidate list that exists on disk rather than picking the first
+# match, so two simultaneously-present default-named files (even if one is
+# just a symlink to the other) get merged with themselves, silently
+# duplicating list fields like `ports`/`depends_on`. Confirmed the hard way.
 #
 # Usage:
 #   podman-compose up --build          (or: docker compose up --build)
@@ -11,8 +17,10 @@ version: "3.8"
 #
 # The frontend nginx container proxies /api/* to the backend container over
 # the compose-managed network, so only one port needs to be published.
-# backend/Dockerfile and frontend/Dockerfile are likewise symlinks to
-# Containerfile, so a plain `docker build ./backend` also needs no -f.
+# backend/Dockerfile and frontend/Dockerfile are symlinks to Containerfile
+# (no equivalent multi-file hazard there -- `docker build` only ever reads
+# one Dockerfile per invocation), so a plain `docker build ./backend` also
+# needs no -f.
 
 services:
   backend:

@@ -1,6 +1,18 @@
 import React from "react";
 
-export default function CertificatePanel({ cert }) {
+function trustLabel(trusted) {
+  if (trusted === true) return "✓ trusted";
+  if (trusted === false) return "✗ not trusted";
+  return "unknown";
+}
+
+function caaLabel(caa) {
+  if (!caa || !caa.applicable) return "n/a (bare IP)";
+  if (caa.note) return "could not check";
+  return caa.records.length > 0 ? `${caa.records.length} record(s)` : "none found";
+}
+
+export default function CertificatePanel({ cert, caa }) {
   if (!cert) {
     return (
       <div className="panel">
@@ -15,6 +27,7 @@ export default function CertificatePanel({ cert }) {
     ["Subject", cert.subject],
     ["Issuer", cert.issuer],
     ["Self-signed", cert.self_signed ? "yes" : "no"],
+    ["Chain trust", trustLabel(cert.chain_trusted)],
     ["Key", `${cert.key_type} / ${cert.key_bits} bits`],
     ["Signature algorithm", cert.signature_algorithm],
     ["Valid from", new Date(cert.not_before).toLocaleDateString()],
@@ -24,6 +37,7 @@ export default function CertificatePanel({ cert }) {
         cert.expired ? "EXPIRED" : `${cert.days_until_expiry}d left`
       })`,
     ],
+    ["DNS CAA", caaLabel(caa)],
   ];
   return (
     <div className="panel">
@@ -31,7 +45,7 @@ export default function CertificatePanel({ cert }) {
       {rows.map(([k, v]) => (
         <div className="kv-row" key={k}>
           <span className="k">{k}</span>
-          <span className="v">{v}</span>
+          <span className={`v ${k === "Chain trust" && cert.chain_trusted === false ? "v-bad" : ""}`}>{v}</span>
         </div>
       ))}
       {cert.sans.length > 0 && (
@@ -41,7 +55,7 @@ export default function CertificatePanel({ cert }) {
         </div>
       )}
       <div style={{ marginTop: "0.6rem", color: "var(--text-muted)", fontSize: "0.78rem" }}>
-        {cert.trust_note}
+        {cert.chain_trusted === false ? cert.chain_trust_note : cert.trust_note}
       </div>
     </div>
   );
