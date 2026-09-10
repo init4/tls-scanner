@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+#
+# Stage 1: build OpenSSL 3.5.x from source.
+#
+# Why: the scanner shells out to `openssl s_client -groups <name>` to test
+# post-quantum hybrid key-exchange groups (X25519MLKEM768 etc). Those group
+# names only exist in OpenSSL >= 3.5. Most distro base images (Debian
+# bookworm, Ubuntu 22.04/24.04) still ship 3.0.x/3.1.x, so we build our own
+# copy rather than depend on whatever the base image happens to carry.
+# If you already know your build environment has OpenSSL 3.5+ available,
+# you can delete this stage and just `apt-get install openssl` in the final
+# stage instead -- the app degrades gracefully either way (PQC checks report
+# "untestable" instead of failing the whole scan).
+FROM docker.io/library/debian:bookworm-slim AS openssl-builder
+
+ARG OPENSSL_VERSION=3.5.0
+# SHA256 of openssl-3.5.0.tar.gz, published at
+# https://github.com/openssl/openssl/releases/tag/openssl-3.5.0 -- pinned so
+# a compromised mirror/CDN can't swap the source out from under the build.
+ARG OPENSSL_SHA256=344d0a79f1a9b08029b0744e2cc401a43f9c90acd1044d09a530b4885a8e9fc0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential perl ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN wget -q https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz \
+    && echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c - \
+    && tar xzf openssl-${OPENSSL_VERSION}.tar.gz
+
+WORKDIR /build/openssl-3.5.0
+RUN ./config --prefix=/opt/openssl-pqc --libdir=lib shared \
+    && make -j"$(nproc)" \
+    && make install_sw
+
+# ---------------------------------------------------------------------------
+# Stage 2: the actual application image
+# ---------------------------------------------------------------------------
+FROM docker.io/library/python:3.12-slim-bookworm
+
+COPY --from=openssl-builder /opt/openssl-pqc /opt/openssl-pqc
+ENV PATH="/opt/openssl-pqc/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/openssl-pqc/lib:${LD_LIBRARY_PATH}" \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+# Non-root: podman-friendly (works fine with rootless podman's default
+# user namespace remapping too).
+RUN useradd --no-create-home --uid 10001 scanner
+USER scanner
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s CMD ["python", "-c", \
+    "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"]
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

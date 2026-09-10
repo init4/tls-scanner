@@ -1,0 +1,35 @@
+version: "3.8"
+
+# Usage:
+#   podman-compose up --build          (or: docker-compose up --build)
+#   open http://localhost:8080
+#
+# The frontend nginx container proxies /api/* to the backend container over
+# the compose-managed network, so only one port needs to be published.
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Containerfile
+    container_name: tls-scanner-backend
+    # No CORS_ALLOW_ORIGINS set: the frontend reaches the API same-origin
+    # through nginx's /api proxy, so cross-origin access isn't needed. Only
+    # set this if something other than the shipped frontend calls the API
+    # directly from a browser.
+    # Not published to the host on purpose -- only the frontend's nginx
+    # reverse proxy needs to reach it, on the internal compose network.
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Containerfile
+    container_name: tls-scanner-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

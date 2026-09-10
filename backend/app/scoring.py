@@ -1,0 +1,221 @@
+"""
+Turns raw protocol/cipher/certificate/PQC data into scores, a letter grade,
+and a findings list the frontend can render as a checklist.
+
+Grading philosophy
+-------------------
+* The headline grade (A+ .. F) reflects CLASSICAL TLS hygiene: protocol
+  versions, cipher strength, certificate health. This is what "secure
+  today" means.
+* PQC readiness is reported as its OWN separate score/label rather than
+  blended into the headline grade. Almost no server today negotiates a
+  PQC hybrid group, so folding it into the main grade would make every
+  score look artificially bad; it's forward-looking information, not a
+  pass/fail on today's baseline.
+"""
+from __future__ import annotations
+
+from typing import List
+
+from .models import (
+    CertificateInfo,
+    CipherResult,
+    Finding,
+    ProtocolResult,
+    PqcGroupResult,
+    Scoring,
+)
+
+
+def _protocol_score(protocols: List[ProtocolResult], findings: List[Finding]) -> int:
+    by_name = {p.name: p for p in protocols}
+    score = 100
+    tls13 = by_name.get("TLSv1.3")
+    tls12 = by_name.get("TLSv1.2")
+    tls11 = by_name.get("TLSv1.1")
+    tls10 = by_name.get("TLSv1.0")
+    sslv3 = by_name.get("SSLv3")
+
+    # Currently unreachable: scanner.py never probes SSLv3 (version is
+    # hardcoded to None, so `supported` is always None here). Kept so the
+    # rule fires correctly if SSLv3 probing is ever added back.
+    if sslv3 and sslv3.supported:
+        score = 0
+        findings.append(Finding(severity="critical",
+                                 message="SSLv3 is supported. This protocol is broken (POODLE) and must be disabled."))
+    if tls10 and tls10.supported:
+        score = min(score, 55)
+        findings.append(Finding(severity="high",
+                                 message="TLS 1.0 is supported. Deprecated by all major browsers and PCI-DSS; disable it."))
+    if tls11 and tls11.supported:
+        score = min(score, 60)
+        findings.append(Finding(severity="high",
+                                 message="TLS 1.1 is supported. Deprecated; disable it in favor of 1.2/1.3 only."))
+    if tls12 and tls12.supported is False and (not tls13 or not tls13.supported):
+        score = min(score, 20)
+        findings.append(Finding(severity="critical",
+                                 message="Neither TLS 1.2 nor TLS 1.3 could be negotiated."))
+    if tls13 and tls13.supported:
+        findings.append(Finding(severity="info", message="TLS 1.3 is supported. Good."))
+    else:
+        score = min(score, 75)
+        findings.append(Finding(severity="medium",
+                                 message="TLS 1.3 is not supported. Modern clients prefer it for speed and security."))
+    if tls12 and tls12.supported and not (tls13 and tls13.supported):
+        findings.append(Finding(severity="low",
+                                 message="TLS 1.2 is supported but TLS 1.3 is not; consider enabling 1.3 as well."))
+    return max(0, min(100, score))
+
+
+def _cipher_score(ciphers: List[CipherResult], findings: List[Finding]) -> int:
+    supported = [c for c in ciphers if c.supported]
+    if not supported:
+        findings.append(Finding(severity="critical",
+                                 message="No cipher suite could be enumerated as supported; the server may be unreachable."))
+        return 0
+
+    score = 100
+    insecure = [c for c in supported if c.strength == "insecure"]
+    weak = [c for c in supported if c.strength == "weak"]
+    strong_aead_pfs = [c for c in supported if c.strength == "strong" and c.forward_secrecy and c.aead]
+
+    for c in insecure:
+        score -= 35
+        findings.append(Finding(severity="critical",
+                                 message=f"Insecure cipher suite negotiable: {c.name} ({c.protocol})."))
+    for c in weak:
+        score -= 12
+        findings.append(Finding(severity="medium",
+                                 message=f"Weak cipher suite negotiable: {c.name} ({c.protocol}) -- no forward secrecy or AEAD."))
+    if strong_aead_pfs:
+        findings.append(Finding(severity="info",
+                                 message=f"{len(strong_aead_pfs)} strong AEAD cipher suite(s) with forward secrecy are supported."))
+    else:
+        score -= 20
+        findings.append(Finding(severity="high",
+                                 message="No modern AEAD cipher suite with forward secrecy was found."))
+    return max(0, min(100, score))
+
+
+def _certificate_score(cert: CertificateInfo | None, findings: List[Finding]) -> int:
+    if cert is None:
+        findings.append(Finding(severity="medium",
+                                 message="Certificate could not be retrieved or parsed."))
+        return 50
+
+    score = 100
+    if cert.expired:
+        score -= 60
+        findings.append(Finding(severity="critical", message="Certificate is expired."))
+    elif cert.days_until_expiry < 14:
+        score -= 20
+        findings.append(Finding(severity="high",
+                                 message=f"Certificate expires in {cert.days_until_expiry} day(s)."))
+    elif cert.days_until_expiry < 30:
+        score -= 8
+        findings.append(Finding(severity="low",
+                                 message=f"Certificate expires in {cert.days_until_expiry} day(s)."))
+
+    if cert.key_type == "RSA" and cert.key_bits < 2048:
+        score -= 50
+        findings.append(Finding(severity="critical",
+                                 message=f"RSA key is only {cert.key_bits} bits; 2048+ is the minimum acceptable size."))
+    if cert.key_type == "EC" and cert.key_bits < 224:
+        score -= 50
+        findings.append(Finding(severity="critical",
+                                 message=f"EC key uses a {cert.key_bits}-bit curve, weaker than recommended."))
+
+    sig_alg = cert.signature_algorithm.lower()
+    if "md5" in sig_alg or "sha1" in sig_alg:
+        score -= 40
+        findings.append(Finding(severity="high",
+                                 message=f"Certificate is signed with {cert.signature_algorithm}, a broken/weak hash."))
+
+    if cert.self_signed:
+        findings.append(Finding(severity="info",
+                                 message="Certificate is self-signed (expected for internal hosts/IPs; not scored down)."))
+
+    return max(0, min(100, score))
+
+
+def _pqc_readiness(groups: List[PqcGroupResult], findings: List[Finding]):
+    final_supported = [g for g in groups if g.kind == "hybrid-final" and g.supported is True]
+    draft_supported = [g for g in groups if g.kind == "hybrid-draft" and g.supported is True]
+    all_untestable = all(g.supported is None for g in groups if g.kind != "classical")
+
+    if all_untestable:
+        findings.append(Finding(severity="info",
+                                 message="PQC hybrid groups could not be tested: the scanner's local OpenSSL build "
+                                         "doesn't recognise the ML-KEM group names. Rebuild the backend image with "
+                                         "OpenSSL 3.5+ to enable this check."))
+        return 0, "Untestable (upgrade scanner's OpenSSL)"
+
+    if final_supported:
+        score = min(100, 40 * len(final_supported) + 20)
+        findings.append(Finding(severity="info",
+                                 message=f"Server negotiates {len(final_supported)} standardized ML-KEM hybrid "
+                                         f"group(s): {', '.join(g.name for g in final_supported)}."))
+        label = "Hybrid PQC ready" if len(final_supported) >= 1 else "Partial"
+        return score, label
+
+    if draft_supported:
+        findings.append(Finding(severity="info",
+                                 message="Server only supports a DRAFT (pre-standard) Kyber hybrid group, not the "
+                                         "final ML-KEM codepoints. Treat as legacy interop, not production PQC readiness."))
+        return 15, "Draft support only"
+
+    findings.append(Finding(severity="low",
+                             message="No post-quantum hybrid key-exchange group was negotiated. This is normal for "
+                                     "most servers today, but worth planning for as PQC migration timelines firm up."))
+    return 0, "Not PQC-ready"
+
+
+def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List[CipherResult]) -> str:
+    by_name = {p.name: p for p in protocols}
+    sslv3 = by_name.get("SSLv3")
+    tls10 = by_name.get("TLSv1.0")
+    has_insecure_cipher = any(c.supported and c.strength == "insecure" for c in ciphers)
+
+    if (sslv3 and sslv3.supported) or has_insecure_cipher:
+        return "F"
+    if tls10 and tls10.supported:
+        score = min(score, 65)
+
+    if score >= 95:
+        return "A+"
+    if score >= 85:
+        return "A"
+    if score >= 70:
+        return "B"
+    if score >= 55:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+def compute_scoring(protocols: List[ProtocolResult], ciphers: List[CipherResult],
+                     certificate: CertificateInfo | None,
+                     pqc_groups: List[PqcGroupResult]) -> Scoring:
+    findings: List[Finding] = []
+
+    protocol_score = _protocol_score(protocols, findings)
+    cipher_score = _cipher_score(ciphers, findings)
+    certificate_score = _certificate_score(certificate, findings)
+    pqc_score, pqc_label = _pqc_readiness(pqc_groups, findings)
+
+    overall_score = round(
+        protocol_score * 0.40 + cipher_score * 0.35 + certificate_score * 0.25
+    )
+    overall_grade = _grade_from_score(overall_score, protocols, ciphers)
+
+    return Scoring(
+        protocol_score=protocol_score,
+        cipher_score=cipher_score,
+        certificate_score=certificate_score,
+        overall_score=overall_score,
+        overall_grade=overall_grade,
+        pqc_readiness_score=pqc_score,
+        pqc_readiness_label=pqc_label,
+        findings=findings,
+    )

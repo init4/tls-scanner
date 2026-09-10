@@ -1,0 +1,311 @@
+"""
+Core scanning primitives.
+
+Design notes
+-------------
+* Everything here deliberately connects with certificate verification
+  DISABLED (ssl.CERT_NONE / check_hostname=False). This tool is meant to
+  probe internal services, bare IPs and boxes with self-signed or expired
+  certs -- the kind of thing a normal TLS client would refuse to talk to.
+  We still *inspect and report* on the certificate; we just don't let a
+  broken chain stop the scan.
+* Every probe has its own short socket timeout and every probe is
+  independent, so callers can run them concurrently in a thread pool
+  (see app/main.py) to keep wall-clock scan time low.
+"""
+from __future__ import annotations
+
+import socket
+import ssl
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import NameOID
+
+from .models import CertificateInfo, CipherResult, ProtocolResult, PqcGroupResult
+
+# ---------------------------------------------------------------------------
+# Protocol probing
+# ---------------------------------------------------------------------------
+
+PROTOCOL_VERSIONS = [
+    ("SSLv3", None),  # handled specially -- almost never available in modern OpenSSL
+    ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
+    ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
+    ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
+    ("TLSv1.3", ssl.TLSVersion.TLSv1_3),
+]
+
+
+def _bare_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # Allow legacy renegotiation/weak settings to not get in our own way --
+    # we WANT to be able to reach weak servers in order to report on them.
+    ctx.set_ciphers("ALL:@SECLEVEL=0")
+    return ctx
+
+
+def probe_protocol(host: str, port: int, name: str, version, sni: Optional[str],
+                    timeout: float) -> ProtocolResult:
+    if version is None:
+        return ProtocolResult(
+            name=name, supported=None, tested=False,
+            note="Not probed: no longer negotiable via the local OpenSSL/Python ssl stack",
+        )
+    try:
+        ctx = _bare_context()
+        ctx.minimum_version = version
+        ctx.maximum_version = version
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+                tls.do_handshake()
+                return ProtocolResult(name=name, supported=True, tested=True)
+    except ssl.SSLError as e:
+        return ProtocolResult(name=name, supported=False, tested=True, note=str(e))
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return ProtocolResult(name=name, supported=False, tested=True,
+                               note=f"connection issue: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Cipher suite enumeration
+# ---------------------------------------------------------------------------
+
+# A representative spread of TLS 1.2-and-below cipher suites: modern AEAD
+# suites through to intentionally weak/legacy ones, so the scorer has
+# something meaningful to grade against.
+TLS12_CANDIDATE_CIPHERS = [
+    # (openssl_name, strength, forward_secrecy, aead)
+    ("ECDHE-ECDSA-AES256-GCM-SHA384", "strong", True, True),
+    ("ECDHE-RSA-AES256-GCM-SHA384", "strong", True, True),
+    ("ECDHE-ECDSA-CHACHA20-POLY1305", "strong", True, True),
+    ("ECDHE-RSA-CHACHA20-POLY1305", "strong", True, True),
+    ("ECDHE-ECDSA-AES128-GCM-SHA256", "strong", True, True),
+    ("ECDHE-RSA-AES128-GCM-SHA256", "strong", True, True),
+    ("DHE-RSA-AES256-GCM-SHA384", "acceptable", True, True),
+    ("DHE-RSA-AES128-GCM-SHA256", "acceptable", True, True),
+    ("ECDHE-RSA-AES256-SHA384", "acceptable", True, False),
+    ("ECDHE-RSA-AES128-SHA256", "acceptable", True, False),
+    ("AES256-GCM-SHA384", "weak", False, True),
+    ("AES128-GCM-SHA256", "weak", False, True),
+    ("AES256-SHA256", "weak", False, False),
+    ("AES128-SHA", "weak", False, False),
+    ("DES-CBC3-SHA", "insecure", False, False),
+    ("RC4-SHA", "insecure", False, False),
+    ("RC4-MD5", "insecure", False, False),
+    ("EXP-RC4-MD5", "insecure", False, False),
+    ("NULL-SHA", "insecure", False, False),
+    ("ADH-AES256-SHA", "insecure", True, False),
+]
+
+TLS13_CANDIDATE_SUITES = [
+    ("TLS_AES_256_GCM_SHA384", "strong"),
+    ("TLS_CHACHA20_POLY1305_SHA256", "strong"),
+    ("TLS_AES_128_GCM_SHA256", "strong"),
+    ("TLS_AES_128_CCM_SHA256", "acceptable"),
+    ("TLS_AES_128_CCM_8_SHA256", "weak"),
+]
+
+
+def probe_tls12_cipher(host: str, port: int, sni: Optional[str], timeout: float,
+                        cipher_name: str, strength: str, pfs: bool,
+                        aead: bool) -> Optional[CipherResult]:
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_ciphers(f"{cipher_name}:@SECLEVEL=0")
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+                tls.do_handshake()
+                return CipherResult(name=cipher_name, protocol="TLSv1.2", supported=True,
+                                     strength=strength, forward_secrecy=pfs, aead=aead)
+    except ssl.SSLError:
+        return CipherResult(name=cipher_name, protocol="TLSv1.2", supported=False,
+                             strength=strength, forward_secrecy=pfs, aead=aead)
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None  # transport-level failure, not a useful signal either way
+
+
+def probe_tls13_suite(host: str, port: int, sni: Optional[str], timeout: float,
+                       suite_name: str, strength: str) -> Optional[CipherResult]:
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        if not hasattr(ctx, "set_ciphersuites"):
+            # Some Python/OpenSSL builds don't expose per-suite pinning for
+            # TLS 1.3. Degrade gracefully rather than crashing the scan --
+            # the protocol-level TLSv1.3 probe still reports support/no-support.
+            return None
+        ctx.set_ciphersuites(suite_name)
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+                tls.do_handshake()
+                return CipherResult(name=suite_name, protocol="TLSv1.3", supported=True,
+                                     strength=strength, forward_secrecy=True, aead=True)
+    except ssl.SSLError:
+        return CipherResult(name=suite_name, protocol="TLSv1.3", supported=False,
+                             strength=strength, forward_secrecy=True, aead=True)
+    except (socket.timeout, ConnectionRefusedError, OSError, AttributeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Post-quantum / hybrid key-exchange group probing
+#
+# We shell out to the system `openssl` CLI for this because the Python `ssl`
+# module has no portable API for pinning a specific TLS 1.3 key-share group.
+# Support for these group names depends entirely on the OpenSSL version
+# baked into the container image (see backend/Containerfile):
+#   * OpenSSL >= 3.5  -> native ML-KEM hybrids (X25519MLKEM768, etc.)
+#   * OpenSSL 3.2/3.3 -> draft Kyber hybrids only, via oqs-provider if installed
+#   * older           -> none of these will be recognised; reported as untestable
+# ---------------------------------------------------------------------------
+
+PQC_CANDIDATE_GROUPS = [
+    ("X25519MLKEM768", "hybrid-final"),
+    ("SecP256r1MLKEM768", "hybrid-final"),
+    ("SecP384r1MLKEM1024", "hybrid-final"),
+    ("X25519Kyber768Draft00", "hybrid-draft"),
+    ("X25519", "classical"),
+    ("secp256r1", "classical"),
+    ("secp384r1", "classical"),
+]
+
+
+def get_openssl_version() -> str:
+    try:
+        out = subprocess.run(["openssl", "version"], capture_output=True, text=True,
+                              timeout=3)
+        return out.stdout.strip() or "unknown"
+    except Exception as e:  # noqa: BLE001
+        return f"unavailable ({e})"
+
+
+def probe_pqc_group(host: str, port: int, sni: Optional[str], timeout: float,
+                     group_name: str, kind: str) -> PqcGroupResult:
+    target = f"{host}:{port}"
+    cmd = [
+        "openssl", "s_client",
+        "-connect", target,
+        "-tls1_3",
+        "-groups", group_name,
+        "-brief",
+    ]
+    if sni:
+        cmd += ["-servername", sni]
+    try:
+        proc = subprocess.run(
+            cmd, input="", capture_output=True, text=True, timeout=timeout + 2,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+
+        # Confirmed against a live openssl 3.0.13 client: an unrecognised
+        # group name fails locally, before any network I/O, with a message
+        # of this shape (not "unknown group" as one might guess):
+        #   "Call to SSL_CONF_cmd(-groups, X25519MLKEM768) failed"
+        #   "...group 'X25519MLKEM768' cannot be set"
+        if "SSL_CONF_cmd" in output or "cannot be set" in output:
+            return PqcGroupResult(name=group_name, kind=kind, supported=None,
+                                   note="local OpenSSL build does not recognise this group name")
+
+        # In `-brief` mode a completed handshake prints "CONNECTION ESTABLISHED"
+        # (NOT the plain "CONNECTED(...)" used without -brief) plus a
+        # "Ciphersuite:" line. Confirmed against a live handshake.
+        negotiated = "CONNECTION ESTABLISHED" in output and "Ciphersuite:" in output
+        if negotiated:
+            return PqcGroupResult(name=group_name, kind=kind, supported=True)
+        return PqcGroupResult(name=group_name, kind=kind, supported=False,
+                               note="handshake did not complete with this group offered")
+    except subprocess.TimeoutExpired:
+        return PqcGroupResult(name=group_name, kind=kind, supported=False,
+                               note="timed out")
+    except FileNotFoundError:
+        return PqcGroupResult(name=group_name, kind=kind, supported=None,
+                               note="openssl CLI not available in this container")
+
+
+# ---------------------------------------------------------------------------
+# Certificate inspection
+# ---------------------------------------------------------------------------
+
+def get_certificate_info(host: str, port: int, sni: Optional[str],
+                          timeout: float) -> Optional[CertificateInfo]:
+    try:
+        ctx = _bare_context()
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+                der = tls.getpeercert(binary_form=True)
+        if not der:
+            return None
+        cert = x509.load_der_x509_certificate(der)
+
+        subject = cert.subject.rfc4514_string()
+        issuer = cert.issuer.rfc4514_string()
+        self_signed = subject == issuer
+
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
+        now = datetime.now(timezone.utc)
+        days_left = (not_after - now).days
+        expired = now > not_after
+
+        pub = cert.public_key()
+        if isinstance(pub, rsa.RSAPublicKey):
+            key_type, key_bits = "RSA", pub.key_size
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            key_type, key_bits = "EC", pub.curve.key_size
+        else:
+            key_type, key_bits = type(pub).__name__, 0
+
+        try:
+            san_ext = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            dns_names = list(san_ext.get_values_for_type(x509.DNSName))
+            ip_names = [str(ip) for ip in san_ext.get_values_for_type(x509.IPAddress)]
+            sans = dns_names + ip_names
+        except x509.ExtensionNotFound:
+            sans = []
+
+        if self_signed:
+            trust_note = "Self-signed: not chained to any CA. Expected for internal/dev hosts."
+        else:
+            trust_note = ("Chain verification was skipped by design (this tool talks to "
+                           "untrusted/self-signed endpoints on purpose); trust was not "
+                           "independently established.")
+
+        return CertificateInfo(
+            subject=subject,
+            issuer=issuer,
+            self_signed=self_signed,
+            not_before=not_before.isoformat(),
+            not_after=not_after.isoformat(),
+            days_until_expiry=days_left,
+            expired=expired,
+            key_type=key_type,
+            key_bits=key_bits,
+            signature_algorithm=cert.signature_algorithm_oid._name,
+            sans=list(sans) if sans else [],
+            trust_note=trust_note,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_ip(host: str) -> Optional[str]:
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None

@@ -1,0 +1,77 @@
+# Pure-podman deployment, no compose layer needed:
+#
+#   podman build -t localhost/tls-scanner-backend:latest ./backend
+#   podman build -t localhost/tls-scanner-frontend:latest ./frontend
+#   podman play kube deploy/pod.yaml
+#
+# Tear down with:
+#   podman play kube --down deploy/pod.yaml
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tls-scanner
+  labels:
+    app: tls-scanner
+spec:
+  containers:
+    - name: backend
+      image: localhost/tls-scanner-backend:latest
+      imagePullPolicy: Never
+      # No CORS_ALLOW_ORIGINS: nginx proxies /api same-origin, so cross-origin
+      # access isn't needed. Set it only if something calls the API directly
+      # from a browser on another origin.
+      ports:
+        - containerPort: 8000
+      # Not published to the host: the frontend container reaches it via
+      # 127.0.0.1 inside the shared pod network namespace.
+
+    - name: frontend
+      image: localhost/tls-scanner-frontend:latest
+      imagePullPolicy: Never
+      ports:
+        - containerPort: 8080
+          hostPort: 8080
+      volumeMounts:
+        # Mounted over the whole directory rather than subPath onto a single
+        # file -- podman's kube-play subPath handling for a single file
+        # inside an existing directory is unreliable across versions and
+        # can fail with "Not a directory: OCI runtime error". Mounting the
+        # ConfigMap over the entire conf.d directory (it contains exactly
+        # one key, default.conf) sidesteps that.
+        - name: nginx-pod-conf
+          mountPath: /etc/nginx/conf.d
+
+  volumes:
+    - name: nginx-pod-conf
+      configMap:
+        name: tls-scanner-nginx-conf
+
+---
+# Containers in the same Pod share one network namespace, so unlike the
+# compose deployment there's no "backend" DNS name -- nginx talks to the
+# other container over 127.0.0.1 instead. This ConfigMap overrides the
+# nginx.conf baked into the frontend image with that one change.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tls-scanner-nginx-conf
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 30s;
+        }
+    }
