@@ -152,11 +152,15 @@ def scan(req: ScanRequest):
     tls13_supported = any(p.name == "TLSv1.3" and p.supported for p in protocols)
     tls13_ciphers_identified = any(c.protocol == "TLSv1.3" for c in ciphers)
     if tls13_supported and not tls13_ciphers_identified:
-        # TLS 1.3 mandates AEAD-only cipher suites, so a successful protocol
-        # handshake is itself proof of a strong suite even when this Python
-        # build can't pin/enumerate which exact one was negotiated.
-        errors.append("TLS 1.3 is supported but the specific cipher suite could not be "
-                      "identified (local Python ssl build lacks per-suite pinning).")
+        # TLS 1.3 cipher suites are pinned via the openssl CLI (see
+        # scanner.probe_tls13_suite); this only fires if every one of those
+        # subprocess probes failed outright (e.g. openssl missing from the
+        # image, or every individual connection attempt timing out) while
+        # the separate protocol-level handshake still succeeded. TLS 1.3
+        # mandates AEAD-only cipher suites, so that handshake is itself proof
+        # of a strong suite even when we can't name which one.
+        errors.append("TLS 1.3 is supported but no candidate cipher suite probe completed "
+                      "successfully.")
         ciphers.append(CipherResult(
             name="(TLS 1.3 suite not identified)", protocol="TLSv1.3", supported=True,
             strength="strong", forward_secrecy=True, aead=True,

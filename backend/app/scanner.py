@@ -402,27 +402,39 @@ def probe_tls12_cipher(host: str, port: int, sni: Optional[str], timeout: float,
 
 def probe_tls13_suite(host: str, port: int, sni: Optional[str], timeout: float,
                        suite_name: str, strength: str) -> Optional[CipherResult]:
+    # Python's ssl.SSLContext.set_ciphersuites() is only present if the _ssl
+    # C extension was *compiled* against an OpenSSL that exposed it -- a
+    # property fixed when the base image's Python binary was built, and
+    # unaffected by pointing LD_LIBRARY_PATH at our own newer OpenSSL at
+    # runtime. The openssl CLI has no such limitation (it's the 3.5 build we
+    # compiled ourselves), so pin the suite there instead -- same approach as
+    # probe_pqc_group below.
+    target = f"{host}:{port}"
+    cmd = ["openssl", "s_client", "-connect", target, "-tls1_3",
+           "-ciphersuites", suite_name, "-brief"]
+    if sni:
+        cmd += ["-servername", sni]
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
-        if not hasattr(ctx, "set_ciphersuites"):
-            # Some Python/OpenSSL builds don't expose per-suite pinning for
-            # TLS 1.3. Degrade gracefully rather than crashing the scan --
-            # the protocol-level TLSv1.3 probe still reports support/no-support.
+        proc = subprocess.run(cmd, input="", capture_output=True, text=True,
+                               timeout=timeout + 2)
+        output = (proc.stdout or "") + (proc.stderr or "")
+
+        if "no ciphers enabled" in output.lower() or "no ciphers available" in output.lower():
+            # Not every TLS 1.3 suite ships enabled-by-default in this
+            # OpenSSL build's own cipher list (TLS_AES_128_CCM_8_SHA256
+            # notably doesn't) -- that's a statement about the scanner's own
+            # OpenSSL defaults, not about the target server.
             return None
-        ctx.set_ciphersuites(suite_name)
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=sni) as tls:
-                tls.do_handshake()
-                return CipherResult(name=suite_name, protocol="TLSv1.3", supported=True,
-                                     strength=strength, forward_secrecy=True, aead=True)
-    except ssl.SSLError:
+
+        negotiated = "CONNECTION ESTABLISHED" in output and "Ciphersuite:" in output
+        if negotiated:
+            return CipherResult(name=suite_name, protocol="TLSv1.3", supported=True,
+                                 strength=strength, forward_secrecy=True, aead=True)
         return CipherResult(name=suite_name, protocol="TLSv1.3", supported=False,
                              strength=strength, forward_secrecy=True, aead=True)
-    except (socket.timeout, ConnectionRefusedError, OSError, AttributeError):
+    except subprocess.TimeoutExpired:
+        return None
+    except FileNotFoundError:
         return None
 
 
