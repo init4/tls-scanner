@@ -669,12 +669,19 @@ def get_certificate_info(host: str, port: int, sni: Optional[str],
         except x509.ExtensionNotFound:
             sans = []
 
+        # This connection deliberately skips verification (ssl.CERT_NONE, see
+        # _bare_context) so an untrusted/self-signed cert can't abort the
+        # scan before we get to inspect it -- but that's just this probe's
+        # own caveat about itself, not the final word on trust. The
+        # independent check_chain_trust() probe (see its chain_trusted /
+        # chain_trust_note fields, merged in by main.py) is what actually
+        # answers whether a standard CA store trusts this chain.
         if self_signed:
             trust_note = "Self-signed: not chained to any CA. Expected for internal/dev hosts."
         else:
-            trust_note = ("Chain verification was skipped by design (this tool talks to "
-                           "untrusted/self-signed endpoints on purpose); trust was not "
-                           "independently established.")
+            trust_note = ("This leaf certificate was read over a connection that skips chain "
+                           "verification by design; see 'Chain trust' for the independently "
+                           "verified result.")
 
         return CertificateInfo(
             subject=subject,
@@ -713,7 +720,7 @@ def check_chain_trust(host: str, port: int, sni: Optional[str],
         with socket.create_connection((host, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=verify_hostname) as tls:
                 tls.do_handshake()
-                return True, None
+                return True, "Verified against the system CA trust store."
     except ssl.SSLCertVerificationError as e:
         return False, (e.verify_message or str(e)).strip()
     except ssl.SSLError as e:

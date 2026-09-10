@@ -55,7 +55,7 @@ export default function CertificatePanel({ cert, caa }) {
         </div>
       )}
       <div style={{ marginTop: "0.6rem", color: "var(--text-muted)", fontSize: "0.78rem" }}>
-        {cert.chain_trusted === false ? cert.chain_trust_note : cert.trust_note}
+        {cert.chain_trust_note}
       </div>
     </div>
   );
