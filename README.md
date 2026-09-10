@@ -159,7 +159,7 @@ OpenSSL build inside the **backend container**:
 backend/
   app/
     main.py      FastAPI routes, request orchestration (concurrent probes)
-    scanner.py   protocol / cipher / certificate / PQC-group probes
+    scanner.py   protocol / cipher / certificate / PQC-group / legacy-downgrade probes
     scoring.py   turns raw probe data into scores, grade, findings
     models.py    pydantic schema for the JSON contract
   Containerfile  builds OpenSSL 3.5 from source, then the FastAPI app
@@ -171,6 +171,34 @@ deploy/
   pod.yaml       plain `podman play kube` deployment (no compose needed)
 podman-compose.yml
 ```
+
+## SSLv3 and the other legacy/downgrade checks
+
+Modern OpenSSL (1.1.0+) removed the SSLv3 protocol outright, so there's no
+API -- Python `ssl` or OpenSSL CLI -- that can ask it to negotiate SSLv3
+anymore. To test it anyway, the scanner hand-builds an SSLv3 ClientHello and
+speaks the TLS record layer directly over a raw socket, bypassing the local
+TLS stack's protocol support entirely (the same technique tools like
+`testssl.sh` use). This also covers three extension-level checks the
+`ssl` module has no API for at all, grouped in the UI as "Downgrade &
+legacy checks":
+
+- **Secure renegotiation** (RFC 5746) -- its absence means a server that
+  allows renegotiation is exposed to the plaintext-injection attack
+  (CVE-2009-3555).
+- **TLS compression** -- if a server accepts a compressed cipher, it's
+  exposed to CRIME-style plaintext recovery.
+- **`TLS_FALLBACK_SCSV`** (RFC 7507) -- whether the server actively rejects
+  a ClientHello that looks like a client falling back to an older protocol
+  version after earlier attempts failed. Only meaningful if the server also
+  negotiates a newer version elsewhere in the scan; reported as untestable
+  rather than guessed when a TLS 1.0 ClientHello gets no usable response at
+  all (common on TLS-1.3-only or WAF-fronted hosts).
+
+All of these report `supported: null` (shown as "untestable" in the UI)
+rather than guessing when the probe's ClientHello doesn't get a usable
+response -- that's a statement about what could be determined, not a claim
+that the check failed.
 
 ## Notes / known limitations
 

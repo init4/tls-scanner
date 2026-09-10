@@ -6,6 +6,7 @@ import ProtocolTable from "./components/ProtocolTable.jsx";
 import CipherList from "./components/CipherList.jsx";
 import CertificatePanel from "./components/CertificatePanel.jsx";
 import PqcGroupsPanel from "./components/PqcGroupsPanel.jsx";
+import LegacyChecksPanel from "./components/LegacyChecksPanel.jsx";
 import FindingsList from "./components/FindingsList.jsx";
 import RawJsonPanel from "./components/RawJsonPanel.jsx";
 import { runScan } from "./api.js";
@@ -71,6 +72,7 @@ export default function App() {
 
           <div className="panel-grid">
             <ProtocolTable protocols={result.protocols} />
+            <LegacyChecksPanel checks={result.legacy_checks} />
             <PqcGroupsPanel groups={result.key_exchange_groups} />
             <CipherList ciphers={result.ciphers} />
             <CertificatePanel cert={result.certificate} />

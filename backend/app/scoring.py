@@ -21,13 +21,15 @@ from .models import (
     CertificateInfo,
     CipherResult,
     Finding,
+    LegacyCheckResult,
     ProtocolResult,
     PqcGroupResult,
     Scoring,
 )
 
 
-def _protocol_score(protocols: List[ProtocolResult], findings: List[Finding]) -> int:
+def _protocol_score(protocols: List[ProtocolResult], legacy_checks: List[LegacyCheckResult],
+                     findings: List[Finding]) -> int:
     by_name = {p.name: p for p in protocols}
     score = 100
     tls13 = by_name.get("TLSv1.3")
@@ -36,9 +38,6 @@ def _protocol_score(protocols: List[ProtocolResult], findings: List[Finding]) ->
     tls10 = by_name.get("TLSv1.0")
     sslv3 = by_name.get("SSLv3")
 
-    # Currently unreachable: scanner.py never probes SSLv3 (version is
-    # hardcoded to None, so `supported` is always None here). Kept so the
-    # rule fires correctly if SSLv3 probing is ever added back.
     if sslv3 and sslv3.supported:
         score = 0
         findings.append(Finding(severity="critical",
@@ -64,6 +63,26 @@ def _protocol_score(protocols: List[ProtocolResult], findings: List[Finding]) ->
     if tls12 and tls12.supported and not (tls13 and tls13.supported):
         findings.append(Finding(severity="low",
                                  message="TLS 1.2 is supported but TLS 1.3 is not; consider enabling 1.3 as well."))
+
+    by_legacy_name = {c.name: c for c in legacy_checks}
+    compression = by_legacy_name.get("tls_compression")
+    if compression and compression.supported:
+        score = min(score, 30)
+        findings.append(Finding(severity="critical", message=f"TLS compression is enabled. {compression.note}"))
+
+    secure_reneg = by_legacy_name.get("secure_renegotiation")
+    if secure_reneg and secure_reneg.supported is False:
+        score = min(score, 50)
+        findings.append(Finding(severity="high", message=secure_reneg.note))
+    elif secure_reneg and secure_reneg.supported:
+        findings.append(Finding(severity="info", message="Secure renegotiation (RFC 5746) is supported."))
+
+    fallback = by_legacy_name.get("fallback_scsv")
+    if fallback and fallback.supported is False:
+        findings.append(Finding(severity="low", message=fallback.note))
+    elif fallback and fallback.supported:
+        findings.append(Finding(severity="info", message=fallback.note))
+
     return max(0, min(100, score))
 
 
@@ -196,10 +215,11 @@ def _grade_from_score(score: int, protocols: List[ProtocolResult], ciphers: List
 
 def compute_scoring(protocols: List[ProtocolResult], ciphers: List[CipherResult],
                      certificate: CertificateInfo | None,
-                     pqc_groups: List[PqcGroupResult]) -> Scoring:
+                     pqc_groups: List[PqcGroupResult],
+                     legacy_checks: List[LegacyCheckResult]) -> Scoring:
     findings: List[Finding] = []
 
-    protocol_score = _protocol_score(protocols, findings)
+    protocol_score = _protocol_score(protocols, legacy_checks, findings)
     cipher_score = _cipher_score(ciphers, findings)
     certificate_score = _certificate_score(certificate, findings)
     pqc_score, pqc_label = _pqc_readiness(pqc_groups, findings)

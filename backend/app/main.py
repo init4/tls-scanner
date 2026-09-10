@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import scanner
 from .models import (
     CipherResult,
+    LegacyCheckResult,
     ProtocolResult,
     PqcGroupResult,
     ScanRequest,
@@ -101,12 +102,20 @@ def scan(req: ScanRequest):
             scanner.probe_pqc_group, host, port, sni, timeout, group_name, kind
         )
 
+    for check_name, probe_fn in (
+        ("secure_renegotiation", scanner.probe_secure_renegotiation),
+        ("tls_compression", scanner.probe_compression),
+        ("fallback_scsv", scanner.probe_fallback_scsv),
+    ):
+        futures[("legacy", check_name)] = _executor.submit(probe_fn, host, port, sni, timeout)
+
     cert_future = _executor.submit(scanner.get_certificate_info, host, port, sni, timeout)
     ip_future = _executor.submit(scanner.resolve_ip, host)
 
     protocols: list[ProtocolResult] = []
     ciphers: list[CipherResult] = []
     pqc_groups: list[PqcGroupResult] = []
+    legacy_checks: list[LegacyCheckResult] = []
 
     for (kind, key), fut in futures.items():
         try:
@@ -122,6 +131,8 @@ def scan(req: ScanRequest):
             ciphers.append(result)
         elif kind == "pqc":
             pqc_groups.append(result)
+        elif kind == "legacy":
+            legacy_checks.append(result)
 
     try:
         certificate = cert_future.result()
@@ -151,7 +162,7 @@ def scan(req: ScanRequest):
             strength="strong", forward_secrecy=True, aead=True,
         ))
 
-    scoring = compute_scoring(protocols, ciphers, certificate, pqc_groups)
+    scoring = compute_scoring(protocols, ciphers, certificate, pqc_groups, legacy_checks)
 
     duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -163,6 +174,7 @@ def scan(req: ScanRequest):
         protocols=protocols,
         ciphers=ciphers,
         key_exchange_groups=pqc_groups,
+        legacy_checks=legacy_checks,
         certificate=certificate,
         scoring=scoring,
         errors=errors,

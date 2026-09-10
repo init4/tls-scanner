@@ -15,9 +15,12 @@ Design notes
 """
 from __future__ import annotations
 
+import os
 import socket
 import ssl
+import struct
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -26,14 +29,14 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
-from .models import CertificateInfo, CipherResult, ProtocolResult, PqcGroupResult
+from .models import CertificateInfo, CipherResult, LegacyCheckResult, ProtocolResult, PqcGroupResult
 
 # ---------------------------------------------------------------------------
 # Protocol probing
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSIONS = [
-    ("SSLv3", None),  # handled specially -- almost never available in modern OpenSSL
+    ("SSLv3", None),  # handled specially -- see probe_protocol(), uses the raw-socket path below
     ("TLSv1.0", getattr(ssl.TLSVersion, "TLSv1", None)),
     ("TLSv1.1", getattr(ssl.TLSVersion, "TLSv1_1", None)),
     ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
@@ -54,6 +57,12 @@ def _bare_context() -> ssl.SSLContext:
 def probe_protocol(host: str, port: int, name: str, version, sni: Optional[str],
                     timeout: float) -> ProtocolResult:
     if version is None:
+        if name == "SSLv3":
+            # Modern OpenSSL (1.1.0+) removed the SSLv3 protocol outright, so
+            # there's no ssl.TLSVersion.SSLv3 and no way to ask the Python
+            # ssl module to negotiate it -- test it directly over a raw
+            # socket instead (see probe_sslv3_raw below).
+            return probe_sslv3_raw(host, port, timeout)
         return ProtocolResult(
             name=name, supported=None, tested=False,
             note="Not probed: no longer negotiable via the local OpenSSL/Python ssl stack",
@@ -71,6 +80,262 @@ def probe_protocol(host: str, port: int, name: str, version, sni: Optional[str],
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
         return ProtocolResult(name=name, supported=False, tested=True,
                                note=f"connection issue: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Raw-socket legacy protocol / extension probing
+#
+# Modern OpenSSL (1.1.0+) removed the SSLv3 protocol outright -- there's no
+# ssl.TLSVersion.SSLv3 and no build flag brings it back, so the Python ssl
+# module can never be used to test it. A handful of other checks
+# (secure renegotiation, TLS compression/CRIME, the TLS_FALLBACK_SCSV
+# downgrade guard) live at the handshake-extension level, which ssl also
+# doesn't expose. For all of these we hand-build a ClientHello and speak the
+# record layer directly over a raw socket -- independent of whatever
+# protocol/extension support the local TLS stack happens to have. This is
+# the same technique dedicated scanners like testssl.sh use for the same
+# reason.
+# ---------------------------------------------------------------------------
+
+_TLS_RECORD_ALERT = 21
+_TLS_RECORD_HANDSHAKE = 22
+_HANDSHAKE_CLIENT_HELLO = 1
+_HANDSHAKE_SERVER_HELLO = 2
+
+_ALERT_DESCRIPTIONS = {
+    40: "handshake_failure", 70: "protocol_version", 86: "inappropriate_fallback",
+}
+
+# Cipher suite codepoints are shared across protocol versions -- offering a
+# spread of old and new ones just maximizes the chance *some* suite matches
+# whatever the server is willing to negotiate, so a probe failure reflects
+# the thing being tested rather than a cipher-list mismatch.
+_SSLV3_CIPHER_SUITES = [0x0004, 0x0005, 0x000A, 0x002F, 0x0035]  # RC4-MD5/SHA, 3DES, AES128/256-SHA
+_MODERN_CIPHER_SUITES = [0xC02F, 0xC030, 0xC013, 0xC014, 0x002F, 0x0035, 0x000A, 0x0005]
+_FALLBACK_SCSV = 0x5600
+_RENEGOTIATION_INFO_EXT = 0xFF01
+_SERVER_NAME_EXT = 0x0000
+
+
+def _encode_extension(ext_type: int, data: bytes) -> bytes:
+    return struct.pack(">HH", ext_type, len(data)) + data
+
+
+def _encode_sni_extension(hostname: str) -> bytes:
+    name = hostname.encode("ascii")
+    entry = b"\x00" + struct.pack(">H", len(name)) + name  # name_type 0 == host_name
+    name_list = struct.pack(">H", len(entry)) + entry
+    return _encode_extension(_SERVER_NAME_EXT, name_list)
+
+
+def _build_client_hello(version: tuple[int, int], cipher_suites: list[int],
+                         compression_methods: list[int], extensions: bytes = b"") -> bytes:
+    body = struct.pack(">BB", *version)
+    body += os.urandom(32)
+    body += b"\x00"  # session_id length: no session to resume
+    body += struct.pack(">H", len(cipher_suites) * 2)
+    for cs in cipher_suites:
+        body += struct.pack(">H", cs)
+    body += struct.pack(">B", len(compression_methods)) + bytes(compression_methods)
+    if extensions:
+        body += struct.pack(">H", len(extensions)) + extensions
+    handshake = struct.pack(">B", _HANDSHAKE_CLIENT_HELLO) + len(body).to_bytes(3, "big") + body
+    record = struct.pack(">BBB", _TLS_RECORD_HANDSHAKE, *version) + struct.pack(">H", len(handshake)) + handshake
+    return record
+
+
+def _modern_client_hello(version: tuple[int, int], cipher_suites: list[int],
+                          compression_methods: list[int], sni: Optional[str],
+                          extra_extensions: bytes = b"") -> bytes:
+    extensions = extra_extensions
+    if sni:
+        try:
+            extensions += _encode_sni_extension(sni)
+        except UnicodeEncodeError:
+            pass  # non-ASCII SNI: skip rather than fail the whole probe
+    return _build_client_hello(version, cipher_suites, compression_methods, extensions)
+
+
+def _recv_exact(sock: socket.socket, n: int, deadline: float) -> Optional[bytes]:
+    buf = b""
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout:
+            return None
+        if not chunk:
+            return None  # connection closed
+        buf += chunk
+    return buf
+
+
+def _recv_record(sock: socket.socket, deadline: float) -> Optional[tuple[int, bytes]]:
+    header = _recv_exact(sock, 5, deadline)
+    if header is None:
+        return None
+    content_type = header[0]
+    length = struct.unpack(">H", header[3:5])[0]
+    payload = _recv_exact(sock, length, deadline)
+    if payload is None:
+        return None
+    return content_type, payload
+
+
+def _parse_server_hello(body: bytes) -> Optional[dict]:
+    try:
+        pos = 2 + 32  # version (unused: client_version already pins the negotiated floor) + random
+        session_id_len = body[pos]
+        pos += 1 + session_id_len
+        cipher_suite = struct.unpack(">H", body[pos:pos + 2])[0]
+        pos += 2
+        compression_method = body[pos]
+        pos += 1
+        extensions: dict[int, bytes] = {}
+        if pos < len(body):
+            ext_total_len = struct.unpack(">H", body[pos:pos + 2])[0]
+            pos += 2
+            end = pos + ext_total_len
+            while pos < end:
+                ext_type = struct.unpack(">H", body[pos:pos + 2])[0]
+                ext_len = struct.unpack(">H", body[pos + 2:pos + 4])[0]
+                pos += 4
+                extensions[ext_type] = body[pos:pos + ext_len]
+                pos += ext_len
+        return {"cipher_suite": cipher_suite, "compression_method": compression_method,
+                "extensions": extensions}
+    except (IndexError, struct.error):
+        return None
+
+
+def _send_client_hello_and_read(host: str, port: int, timeout: float,
+                                 client_hello: bytes) -> tuple[str, object]:
+    """Sends a hand-built ClientHello and classifies the response.
+
+    Returns (kind, data) where kind is one of:
+      "server_hello" -- data is the dict from _parse_server_hello()
+      "alert"        -- data is (level, description) as raw byte values
+      "closed"       -- connection closed with no handshake data at all
+      "timeout"      -- no response within the timeout
+      "error"        -- data is a short string describing what went wrong
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(client_hello)
+            handshake_buf = b""
+            expected_len = None
+            while True:
+                rec = _recv_record(sock, deadline)
+                if rec is None:
+                    if handshake_buf:
+                        return "error", "connection closed mid-handshake-message"
+                    return "closed", None
+                content_type, payload = rec
+                if content_type == _TLS_RECORD_ALERT:
+                    if len(payload) >= 2:
+                        return "alert", (payload[0], payload[1])
+                    return "error", "malformed alert record"
+                if content_type != _TLS_RECORD_HANDSHAKE:
+                    return "error", f"unexpected record type {content_type}"
+                handshake_buf += payload
+                if expected_len is None and len(handshake_buf) >= 4:
+                    expected_len = 4 + int.from_bytes(handshake_buf[1:4], "big")
+                if expected_len is not None and len(handshake_buf) >= expected_len:
+                    break
+            msg_type = handshake_buf[0]
+            if msg_type != _HANDSHAKE_SERVER_HELLO:
+                return "error", f"unexpected handshake message type {msg_type}"
+            parsed = _parse_server_hello(handshake_buf[4:expected_len])
+            if parsed is None:
+                return "error", "could not parse ServerHello"
+            return "server_hello", parsed
+    except socket.timeout:
+        return "timeout", None
+    except (ConnectionRefusedError, OSError) as e:
+        return "error", f"connection issue: {e}"
+
+
+def probe_sslv3_raw(host: str, port: int, timeout: float) -> ProtocolResult:
+    # SSLv3 predates both SNI and the extensions mechanism entirely, so a
+    # real SSLv3 client sends neither -- we don't either. And since (3,0) is
+    # already the lowest version number that exists, any ServerHello we get
+    # back in response can only mean the server actually negotiated SSLv3
+    # (there's nothing lower it could have fallen back to).
+    hello = _build_client_hello((3, 0), _SSLV3_CIPHER_SUITES, [0])
+    kind, data = _send_client_hello_and_read(host, port, timeout, hello)
+    if kind == "server_hello":
+        return ProtocolResult(
+            name="SSLv3", supported=True, tested=True,
+            note="Server completed an SSLv3 handshake (hand-rolled ClientHello over a raw "
+                 "socket -- the local OpenSSL/Python ssl stack no longer supports SSLv3 at all).")
+    if kind == "alert":
+        desc = _ALERT_DESCRIPTIONS.get(data[1], f"alert {data[1]}")
+        return ProtocolResult(name="SSLv3", supported=False, tested=True,
+                               note=f"Server rejected SSLv3 ({desc}).")
+    if kind == "closed":
+        return ProtocolResult(name="SSLv3", supported=False, tested=True,
+                               note="Connection closed without responding to the SSLv3 ClientHello.")
+    if kind == "timeout":
+        return ProtocolResult(name="SSLv3", supported=False, tested=True, note="Timed out.")
+    return ProtocolResult(name="SSLv3", supported=None, tested=True, note=f"Could not determine: {data}")
+
+
+def _legacy_untestable(name: str, kind: str, data: object) -> LegacyCheckResult:
+    reason = {"closed": "connection closed without responding",
+              "timeout": "timed out"}.get(kind, str(data))
+    return LegacyCheckResult(
+        name=name, supported=None,
+        note=f"Could not determine ({reason}) -- most likely this probe's ClientHello doesn't "
+             f"match anything the server is willing to negotiate (e.g. a TLS-1.3-only server).")
+
+
+def probe_secure_renegotiation(host: str, port: int, sni: Optional[str],
+                                timeout: float) -> LegacyCheckResult:
+    hello = _modern_client_hello((3, 3), _MODERN_CIPHER_SUITES, [0], sni,
+                                  extra_extensions=_encode_extension(_RENEGOTIATION_INFO_EXT, b"\x00"))
+    kind, data = _send_client_hello_and_read(host, port, timeout, hello)
+    if kind == "server_hello":
+        supported = _RENEGOTIATION_INFO_EXT in data["extensions"]
+        note = ("Server echoed the renegotiation_info extension (RFC 5746)." if supported else
+                "Server did not echo renegotiation_info -- if it allows renegotiation at all, "
+                "it's exposed to the plaintext-injection renegotiation attack (CVE-2009-3555).")
+        return LegacyCheckResult(name="secure_renegotiation", supported=supported, note=note)
+    return _legacy_untestable("secure_renegotiation", kind, data)
+
+
+def probe_compression(host: str, port: int, sni: Optional[str], timeout: float) -> LegacyCheckResult:
+    hello = _modern_client_hello((3, 3), _MODERN_CIPHER_SUITES, [1, 0], sni)  # offer DEFLATE, then null
+    kind, data = _send_client_hello_and_read(host, port, timeout, hello)
+    if kind == "server_hello":
+        supported = data["compression_method"] != 0
+        note = ("Server selected non-null TLS compression -- exposed to CRIME-style plaintext "
+                "recovery." if supported else "Server did not select TLS compression.")
+        return LegacyCheckResult(name="tls_compression", supported=supported, note=note)
+    return _legacy_untestable("tls_compression", kind, data)
+
+
+def probe_fallback_scsv(host: str, port: int, sni: Optional[str], timeout: float) -> LegacyCheckResult:
+    # Deliberately claims only TLS 1.0 (the whole point of this check is to
+    # simulate a client that has already fallen back after earlier failures)
+    # while also offering the TLS_FALLBACK_SCSV signal cipher.
+    hello = _modern_client_hello((3, 1), [_FALLBACK_SCSV] + _MODERN_CIPHER_SUITES[:4], [0], sni)
+    kind, data = _send_client_hello_and_read(host, port, timeout, hello)
+    if kind == "alert":
+        if data[1] == 86:  # inappropriate_fallback
+            return LegacyCheckResult(name="fallback_scsv", supported=True,
+                                      note="Server rejects version fallback via TLS_FALLBACK_SCSV (RFC 7507).")
+        return _legacy_untestable("fallback_scsv", kind, data)
+    if kind == "server_hello":
+        return LegacyCheckResult(
+            name="fallback_scsv", supported=False,
+            note="Server accepted a TLS 1.0 ClientHello carrying TLS_FALLBACK_SCSV instead of "
+                 "rejecting it. Only a real downgrade risk if the server also negotiates a newer "
+                 "version elsewhere (see protocol results) and some client actually falls back.")
+    return _legacy_untestable("fallback_scsv", kind, data)
 
 
 # ---------------------------------------------------------------------------

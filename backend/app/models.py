@@ -41,6 +41,12 @@ class PqcGroupResult(BaseModel):
     note: Optional[str] = None
 
 
+class LegacyCheckResult(BaseModel):
+    name: str  # "secure_renegotiation" | "tls_compression" | "fallback_scsv"
+    supported: Optional[bool] = None  # None => could not be determined
+    note: Optional[str] = None
+
+
 class CertificateInfo(BaseModel):
     subject: str
     issuer: str
@@ -87,6 +93,7 @@ class ScanResult(BaseModel):
     protocols: List[ProtocolResult]
     ciphers: List[CipherResult]
     key_exchange_groups: List[PqcGroupResult]
+    legacy_checks: List[LegacyCheckResult] = []
     certificate: Optional[CertificateInfo]
     scoring: Scoring
     errors: List[str] = []
