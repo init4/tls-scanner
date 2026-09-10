@@ -35,7 +35,20 @@ export default function App() {
     <div className="app-shell">
       <header className="console-header">
         <h1>
-          <span className="prompt">$</span>tls-pqc-scan
+          <svg
+            className="logo"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 2.5 20 5.5V11c0 5-3.6 8.7-8 10.5C7.6 19.7 4 16 4 11V5.5Z" />
+            <path d="M8.5 12 11 14.5 16 9" />
+          </svg>
+          tls-scanner
         </h1>
         <span className="subtitle">protocols · ciphers · certificate trust · CAA · HTTP headers · PQC readiness</span>
       </header>
