@@ -73,6 +73,7 @@ class DnsCaaRecord(BaseModel):
 class DnsCaaResult(BaseModel):
     applicable: bool  # False for bare-IP targets -- CAA is a DNS record, doesn't apply
     records: List[DnsCaaRecord] = []
+    found_at: Optional[str] = None  # the name the RRset was found on (may be a parent domain)
     note: Optional[str] = None
 
 

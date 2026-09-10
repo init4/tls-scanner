@@ -264,15 +264,17 @@ Three checks that go beyond raw TLS configuration:
   signature algorithm, expiry, self-signed flag -- still happens
   unconditionally either way, same as before; only the grade's relationship
   to trust changed.)
-- **DNS CAA** (RFC 8659): a DNS TXT-like record restricting which CAs may
-  issue certs for a domain. Checked via a hand-rolled DNS query over UDP
-  (Python's stdlib has no API for non-A/AAAA record types) against whatever
-  resolver the container itself is configured with -- deliberately not a
-  hardcoded public resolver like 8.8.8.8, since that would silently break
-  this for internal/split-horizon hostnames. Only queries the exact scanned
-  hostname, not the full RFC 8659 parent-domain/CNAME-walk; good enough to
-  answer "did this host configure CAA", not a full compliance audit. Not
-  applicable to bare-IP targets (CAA is a DNS record, not tied to an IP).
+- **DNS CAA** (RFC 8659): a DNS record restricting which CAs may issue
+  certs for a domain. Checked via a hand-rolled DNS query over UDP (Python's
+  stdlib has no API for non-A/AAAA record types) against whatever resolver
+  the container itself is configured with -- deliberately not a hardcoded
+  public resolver like 8.8.8.8, since that would silently break this for
+  internal/split-horizon hostnames. Follows the RFC 8659 tree-walk: a CAA
+  record on `example.com` governs `sub.example.com` too, so if the exact
+  name has none, its parents are checked in turn (down to the registrable
+  domain -- a bare TLD never has one). The result reports which name the
+  record was actually found on. Still does not follow CNAMEs at each level
+  (rare to matter). Not applicable to bare-IP targets.
 - **HTTP security headers**: a real `GET /` over the established TLS
   connection (no redirect-following), checking for `Strict-Transport-Security`,
   `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`,

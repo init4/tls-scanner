@@ -8,8 +8,12 @@ function trustLabel(trusted) {
 
 function caaLabel(caa) {
   if (!caa || !caa.applicable) return "n/a (bare IP)";
-  if (caa.note) return "could not check";
-  return caa.records.length > 0 ? `${caa.records.length} record(s)` : "none found";
+  if (caa.records.length > 0) {
+    return caa.note && caa.found_at
+      ? `${caa.records.length} record(s) via ${caa.found_at}`
+      : `${caa.records.length} record(s)`;
+  }
+  return caa.note ? "could not check" : "none found";
 }
 
 export default function CertificatePanel({ cert, caa }) {

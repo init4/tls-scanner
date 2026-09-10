@@ -159,8 +159,10 @@ def _certificate_score(cert: CertificateInfo | None, dns_caa: DnsCaaResult | Non
     if dns_caa is not None and dns_caa.applicable:
         if dns_caa.records:
             tags = sorted({f"{r.tag}={r.value}" for r in dns_caa.records})
+            where = f" (inherited from {dns_caa.found_at})" if dns_caa.note and dns_caa.found_at else ""
             findings.append(Finding(severity="info",
-                                     message=f"DNS CAA record(s) present, restricting certificate issuance: {', '.join(tags)}."))
+                                     message=f"DNS CAA record(s) present{where}, restricting certificate "
+                                             f"issuance: {', '.join(tags)}."))
         elif dns_caa.note is None:
             score -= 5
             findings.append(Finding(severity="low",

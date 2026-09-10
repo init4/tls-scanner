@@ -742,11 +742,13 @@ def check_chain_trust(host: str, port: int, sni: Optional[str],
 # tool exists to scan, so it uses whatever resolver the container itself is
 # configured with instead.
 #
-# Known simplification: queries only the exact scanned hostname. The full
-# RFC 8659 lookup algorithm also walks up to parent domains (and follows
-# CNAMEs) when no CAA record exists at the exact name -- good enough to
-# answer "did this host configure CAA", not a substitute for a full
-# CAA-compliance audit.
+# Follows the RFC 8659 Sec 3 tree-walk: if the exact name has no CAA record,
+# check its parent, then that parent, and so on -- a CAA record on
+# example.com governs issuance for sub.example.com too. Stops at the
+# registrable-domain level (2 labels): CAA is never meaningfully published
+# on a bare TLD. Still does NOT follow CNAMEs at each level (rare to matter
+# in practice), so this answers "is issuance for this name constrained by
+# CAA", not a full CA-grade compliance evaluation.
 # ---------------------------------------------------------------------------
 
 _DNS_TYPE_CAA = 257
@@ -832,13 +834,19 @@ def _parse_dns_response(data: bytes, expected_id: int) -> Optional[dict]:
         return None
 
 
-def lookup_caa_records(hostname: str, timeout: float) -> DnsCaaResult:
-    resolvers = _system_resolvers()
-    if not resolvers:
-        return DnsCaaResult(applicable=True, records=[],
-                             note="no DNS resolver configured in this container (/etc/resolv.conf empty or unreadable)")
+def _caa_candidate_names(hostname: str) -> list[str]:
+    labels = hostname.rstrip(".").split(".")
+    names = [".".join(labels[i:]) for i in range(len(labels) - 1)]
+    return names or [hostname]  # single-label host: just query it as-is
 
-    query, query_id = _build_dns_query(hostname, _DNS_TYPE_CAA)
+
+def _query_caa(name: str, resolvers: list[str], timeout: float):
+    """Query one name. Returns (records, reached): records is the list of
+    DnsCaaRecord for `name` (empty list == name resolved fine, no CAA), or
+    None if no resolver produced a usable answer. reached is True if any
+    resolver responded at all."""
+    query, query_id = _build_dns_query(name, _DNS_TYPE_CAA)
+    reached = False
     for resolver_ip in resolvers:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -848,7 +856,10 @@ def lookup_caa_records(hostname: str, timeout: float) -> DnsCaaResult:
         except (socket.timeout, OSError):
             continue
         parsed = _parse_dns_response(data, query_id)
-        if parsed is None or parsed["rcode"] not in (0, 3):  # NOERROR or NXDOMAIN
+        if parsed is None:
+            continue
+        reached = True
+        if parsed["rcode"] not in (0, 3):  # not NOERROR / NXDOMAIN -> resolver trouble, try next
             continue
         records = []
         for rtype, rdata in parsed["answers"]:
@@ -857,8 +868,32 @@ def lookup_caa_records(hostname: str, timeout: float) -> DnsCaaResult:
                 tag = rdata[2:2 + tag_len].decode("ascii", errors="replace")
                 value = rdata[2 + tag_len:].decode("ascii", errors="replace")
                 records.append(DnsCaaRecord(flags=rdata[0], tag=tag, value=value))
-        return DnsCaaResult(applicable=True, records=records)
-    return DnsCaaResult(applicable=True, records=[], note="could not reach any configured DNS resolver")
+        return records, True
+    return None, reached
+
+
+def lookup_caa_records(hostname: str, timeout: float) -> DnsCaaResult:
+    resolvers = _system_resolvers()
+    if not resolvers:
+        return DnsCaaResult(applicable=True,
+                             note="no DNS resolver configured in this container (/etc/resolv.conf empty or unreadable)")
+
+    any_reached = False
+    for name in _caa_candidate_names(hostname):
+        records, reached = _query_caa(name, resolvers, timeout)
+        any_reached = any_reached or reached
+        if records is None:
+            continue
+        if records:
+            inherited = name != hostname
+            note = (f"No CAA record on {hostname} itself; issuance is governed by the record on "
+                    f"{name} (RFC 8659 tree-walk).") if inherited else None
+            return DnsCaaResult(applicable=True, records=records, found_at=name, note=note)
+        # empty: this name has no CAA of its own -- keep walking up
+
+    if not any_reached:
+        return DnsCaaResult(applicable=True, note="could not reach any configured DNS resolver")
+    return DnsCaaResult(applicable=True, records=[])  # walked the whole chain, genuinely none
 
 
 # ---------------------------------------------------------------------------
