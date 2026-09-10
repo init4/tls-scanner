@@ -1,11 +1,18 @@
 version: "3.8"
 
+# This file is also exposed at the repo root as docker-compose.yml (a
+# symlink) purely so plain `docker compose` finds it under its own default
+# filename without needing -f -- podman-compose already checks for
+# "podman-compose.yml" by default, Docker's compose does not.
+#
 # Usage:
-#   podman-compose up --build          (or: docker-compose up --build)
+#   podman-compose up --build          (or: docker compose up --build)
 #   open http://localhost:8080
 #
 # The frontend nginx container proxies /api/* to the backend container over
 # the compose-managed network, so only one port needs to be published.
+# backend/Dockerfile and frontend/Dockerfile are likewise symlinks to
+# Containerfile, so a plain `docker build ./backend` also needs no -f.
 
 services:
   backend:

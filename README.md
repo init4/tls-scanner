@@ -8,9 +8,11 @@ browser or HTTP client would refuse to talk to.
 
 - **Backend**: FastAPI (Python), REST API, JSON responses only.
 - **Frontend**: React + Vite single-page app, calls the backend over `/api`.
-- **Containers**: Podman-first. Works with `podman-compose` or plain
-  `podman play kube`, no Docker required (though the Containerfiles are
-  plain OCI and work fine with `docker build`/`docker compose` too).
+- **Containers**: Podman-first (`podman-compose` or plain `podman play
+  kube`, no Docker required), but also works out of the box with plain
+  Docker -- `docker-compose.yml` and each `Dockerfile` are symlinks to the
+  same `podman-compose.yml`/`Containerfile`s, so there's one build
+  definition either way, not two to keep in sync.
 
 ## Quick start (podman-compose)
 
@@ -40,6 +42,32 @@ podman build -t localhost/tls-scanner-frontend:latest ./frontend
 podman play kube deploy/pod.yaml
 # open http://localhost:8080
 # tear down: podman play kube --down deploy/pod.yaml
+```
+
+## Quick start (Docker)
+
+No separate Docker setup to maintain: `docker-compose.yml` at the repo root
+and `Dockerfile` in each of `backend/` and `frontend/` are symlinks to the
+same `podman-compose.yml` and `Containerfile`s the Podman path uses, so
+there's nothing to keep in sync between the two.
+
+```bash
+git clone <this repo> tls-scanner && cd tls-scanner
+docker compose up --build
+# open http://localhost:8080
+```
+
+Or without compose:
+
+```bash
+docker build -t tls-scanner-backend ./backend
+docker build -t tls-scanner-frontend ./frontend
+docker network create tls-scanner-net
+# --network-alias backend: nginx.conf proxies to http://backend:8000, so the
+# backend container needs to answer to that name on the shared network.
+docker run -d --name tls-scanner-backend --network tls-scanner-net --network-alias backend tls-scanner-backend
+docker run -d --name tls-scanner-frontend --network tls-scanner-net -p 8080:8080 tls-scanner-frontend
+# open http://localhost:8080
 ```
 
 ## API reference
@@ -175,13 +203,16 @@ backend/
     scoring.py   turns raw probe data into scores, grade, findings
     models.py    pydantic schema for the JSON contract
   Containerfile  builds OpenSSL 3.5 from source, then the FastAPI app
+  Dockerfile     symlink -> Containerfile (so plain `docker build` finds it)
 frontend/
   src/           React components (dark "security console" UI)
   nginx.conf     serves the built SPA, proxies /api to the backend
   Containerfile  multi-stage: vite build -> nginx
+  Dockerfile     symlink -> Containerfile
 deploy/
   pod.yaml       plain `podman play kube` deployment (no compose needed)
 podman-compose.yml
+docker-compose.yml  symlink -> podman-compose.yml
 ```
 
 ## SSLv3 and the other legacy/downgrade checks
